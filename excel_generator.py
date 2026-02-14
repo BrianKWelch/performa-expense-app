@@ -1,149 +1,123 @@
-import io
+from io import BytesIO
+from typing import List, Dict, Any
+
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Alignment, PatternFill
 
-def _money(n: float) -> float:
-    try:
-        return float(n)
-    except Exception:
-        return 0.0
 
-def generate_excel(
-    employee_name: str,
-    employee_email: str,
-    location: str,
-    depart,
-    return_date,
-    purpose: str,
-    per_diem_rate: float,
-    per_diem_days: int,
-    expenses: list[dict]
-) -> io.BytesIO:
+def _auto_width(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                v = "" if cell.value is None else str(cell.value)
+                max_len = max(max_len, len(v))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
+
+
+def generate_excel(trip_info: Dict[str, Any], expenses: List[Dict[str, Any]]) -> bytes:
+    """
+    Expected inputs:
+      trip_info: dict built in app.py
+      expenses: list of dicts with keys:
+        category, expense_date, paid_by, description, amount, receipt_file (optional)
+    Returns:
+      Excel file as raw bytes
+    """
+
     wb = Workbook()
+
+    # -------------------------
+    # Sheet 1: Summary
+    # -------------------------
     ws = wb.active
-    ws.title = "Expense Report"
+    ws.title = "Summary"
 
-    # Styles
-    title_font = Font(size=16, bold=True)
-    header_font = Font(bold=True, color="FFFFFF")
-    bold_font = Font(bold=True)
-    center = Alignment(vertical="center")
-    header_fill = PatternFill("solid", fgColor="B10000")  # Performa red vibe
-    thin = Side(style="thin", color="DDDDDD")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill("solid", fgColor="EEEEEE")
+    bold = Font(bold=True)
 
-    # Title
-    ws["A1"] = "PERFORMA"
-    ws["A1"].font = title_font
-    ws["A2"] = "Expense Report"
-    ws["A2"].font = Font(size=12, bold=True)
+    ws["A1"] = "Performa Expense Report"
+    ws["A1"].font = Font(bold=True, size=16)
+    ws["A1"].alignment = Alignment(horizontal="left")
 
-    # Trip summary block
-    ws["A4"] = "Employee"
-    ws["B4"] = employee_name
-    ws["A5"] = "Employee Email"
-    ws["B5"] = employee_email
-    ws["A6"] = "Trip Location"
-    ws["B6"] = location
+    ws["A3"] = "Employee Name"
+    ws["B3"] = trip_info.get("employee_name", "")
+    ws["A4"] = "Employee Email"
+    ws["B4"] = trip_info.get("employee_email", "")
+    ws["A5"] = "Trip Location"
+    ws["B5"] = trip_info.get("location", "")
+    ws["A6"] = "Business Purpose"
+    ws["B6"] = trip_info.get("purpose", "")
     ws["A7"] = "Departure Date"
-    ws["B7"] = str(depart)
+    ws["B7"] = trip_info.get("departure_date", "")
     ws["A8"] = "Return Date"
-    ws["B8"] = str(return_date)
-    ws["A9"] = "Business Purpose"
-    ws["B9"] = purpose
+    ws["B8"] = trip_info.get("return_date", "")
+    ws["A9"] = "Trip Days"
+    ws["B9"] = trip_info.get("trip_days", 0)
 
-    for r in range(4, 10):
-        ws[f"A{r}"].font = bold_font
-        ws[f"A{r}"].alignment = center
-        ws[f"B{r}"].alignment = Alignment(wrap_text=True, vertical="top")
-
-    # Per diem
     ws["A11"] = "Per Diem Rate"
-    ws["B11"] = per_diem_rate
-    ws["A12"] = "Per Diem Days"
-    ws["B12"] = per_diem_days
-    ws["A13"] = "Per Diem Total"
-    ws["B13"] = per_diem_rate * per_diem_days
-    for r in range(11, 14):
-        ws[f"A{r}"].font = bold_font
-        ws[f"B{r}"].number_format = '"$"#,##0.00' if r in (11, 13) else '0'
+    ws["B11"] = float(trip_info.get("per_diem_rate", 0) or 0)
+    ws["A12"] = "Per Diem Total"
+    ws["B12"] = float(trip_info.get("per_diem_total", 0) or 0)
 
-    # Line items header
-    start_row = 15
-    headers = ["Category", "Date", "Description", "Amount", "Paid By", "Reimbursable", "Receipt Attached"]
-    for c, h in enumerate(headers, start=1):
-        cell = ws.cell(row=start_row, column=c, value=h)
-        cell.font = header_font
+    ws["A14"] = "Total Spend"
+    ws["B14"] = float(trip_info.get("total_spend", 0) or 0)
+    ws["A15"] = "Company Paid"
+    ws["B15"] = float(trip_info.get("company_paid", 0) or 0)
+    ws["A16"] = "Employee Paid"
+    ws["B16"] = float(trip_info.get("employee_paid", 0) or 0)
+    ws["A17"] = "Reimbursement Due"
+    ws["B17"] = float(trip_info.get("reimbursement_due", 0) or 0)
+
+    for r in range(3, 18):
+        ws[f"A{r}"].font = bold
+
+    # Format currency fields
+    for cell in ["B11", "B12", "B14", "B15", "B16", "B17"]:
+        ws[cell].number_format = '"$"#,##0.00'
+
+    ws["B6"].alignment = Alignment(wrap_text=True)
+    ws.row_dimensions[6].height = 45
+
+    _auto_width(ws)
+
+    # -------------------------
+    # Sheet 2: Line Items
+    # -------------------------
+    ws2 = wb.create_sheet("Line Items")
+
+    headers = ["Category", "Expense Date", "Description", "Paid By", "Amount", "Receipt Attached"]
+    ws2.append(headers)
+
+    for c in range(1, len(headers) + 1):
+        cell = ws2.cell(row=1, column=c)
+        cell.font = bold
         cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
 
-    # Line items
-    row = start_row + 1
-    employee_paid_total = 0.0
-    company_paid_total = 0.0
-    total_spend = 0.0
+    for e in expenses or []:
+        category = e.get("category", "")
+        expense_date = e.get("expense_date", "")
+        description = e.get("description", "")
+        paid_by = e.get("paid_by", "")
+        amount = float(e.get("amount", 0) or 0)
+        receipt_attached = "Yes" if e.get("receipt_file") else "No"
 
-    for e in expenses:
-        amt = _money(e.get("amount", 0))
-        paid_by = e.get("paid_by", "Employee")
-        reimb = amt if paid_by == "Employee" else 0.0
-        has_receipt = "Yes" if e.get("receipt_name") else "No"
+        ws2.append([category, expense_date, description, paid_by, amount, receipt_attached])
 
-        ws.cell(row=row, column=1, value=e.get("category", "Other"))
-        ws.cell(row=row, column=2, value=str(e.get("date", "")))
-        ws.cell(row=row, column=3, value=e.get("description", ""))
-        ws.cell(row=row, column=4, value=amt)
-        ws.cell(row=row, column=5, value=paid_by)
-        ws.cell(row=row, column=6, value=reimb)
-        ws.cell(row=row, column=7, value=has_receipt)
+    # Currency format for Amount column
+    for row in range(2, ws2.max_row + 1):
+        ws2.cell(row=row, column=5).number_format = '"$"#,##0.00'
+        ws2.cell(row=row, column=3).alignment = Alignment(wrap_text=True)
 
-        ws.cell(row=row, column=4).number_format = '"$"#,##0.00'
-        ws.cell(row=row, column=6).number_format = '"$"#,##0.00'
+    _auto_width(ws2)
 
-        for c in range(1, 8):
-            ws.cell(row=row, column=c).border = border
-            ws.cell(row=row, column=c).alignment = Alignment(vertical="top", wrap_text=True)
-
-        total_spend += amt
-        if paid_by == "Employee":
-            employee_paid_total += amt
-        else:
-            company_paid_total += amt
-
-        row += 1
-
-    per_diem_total = per_diem_rate * per_diem_days
-    reimbursement_due = per_diem_total + employee_paid_total
-
-    # Totals block
-    totals_row = row + 1
-    ws[f"E{totals_row}"] = "Total Spend"
-    ws[f"F{totals_row}"] = total_spend
-    ws[f"E{totals_row+1}"] = "Company Paid"
-    ws[f"F{totals_row+1}"] = company_paid_total
-    ws[f"E{totals_row+2}"] = "Employee Paid"
-    ws[f"F{totals_row+2}"] = employee_paid_total
-    ws[f"E{totals_row+3}"] = "Per Diem"
-    ws[f"F{totals_row+3}"] = per_diem_total
-    ws[f"E{totals_row+4}"] = "Reimbursement Due"
-    ws[f"F{totals_row+4}"] = reimbursement_due
-
-    for r in range(totals_row, totals_row + 5):
-        ws[f"E{r}"].font = bold_font
-        ws[f"F{r}"].number_format = '"$"#,##0.00'
-        ws[f"E{r}"].alignment = Alignment(horizontal="right")
-        ws[f"F{r}"].alignment = Alignment(horizontal="right")
-
-    # Column widths
-    widths = [18, 14, 40, 12, 12, 14, 16]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    ws.freeze_panes = "A16"
-
-    file_stream = io.BytesIO()
-    wb.save(file_stream)
-    file_stream.seek(0)
-    return file_stream
+    # -------------------------
+    # Return bytes
+    # -------------------------
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
