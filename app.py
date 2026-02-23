@@ -1,4 +1,6 @@
 import base64
+import os
+import re
 from datetime import date
 from io import BytesIO
 from typing import List, Dict, Any, Optional
@@ -17,7 +19,8 @@ from sendgrid.helpers.mail import (
     Disposition,
 )
 
-from excel_generator import generate_excel
+from docx import Document  # for NN template population
+from excel_generator import generate_excel  # Guam flow stays unchanged
 
 
 # -----------------------------
@@ -27,6 +30,8 @@ st.set_page_config(page_title="Performa Expense Report", layout="wide")
 
 PER_DIEM_RATE = float(st.secrets.get("PER_DIEM_RATE", 100))
 MAX_ATTACHMENT_MB = float(st.secrets.get("MAX_ATTACHMENT_MB", 18))
+
+TEMPLATES_DIR = "templates"  # NN docx templates live here
 
 CATEGORIES = [
     "Airfare",
@@ -220,6 +225,158 @@ def send_email_with_attachments(
 
 
 # -----------------------------
+# NN Template helpers
+# -----------------------------
+_PLACEHOLDER_PATTERN = re.compile(r"{{\s*([A-Z0-9_]+)\s*}}")
+
+
+def list_docx_templates() -> List[str]:
+    if not os.path.isdir(TEMPLATES_DIR):
+        return []
+    return sorted([f for f in os.listdir(TEMPLATES_DIR) if f.lower().endswith(".docx")])
+
+
+def _replace_placeholders_in_paragraph(paragraph, values: Dict[str, str]) -> None:
+    if not paragraph.runs:
+        return
+    full_text = "".join(run.text for run in paragraph.runs)
+    if "{{" not in full_text:
+        return
+
+    def repl(match):
+        key = match.group(1)
+        return str(values.get(key, match.group(0)))
+
+    new_text = _PLACEHOLDER_PATTERN.sub(repl, full_text)
+    for run in paragraph.runs:
+        run.text = ""
+    paragraph.runs[0].text = new_text
+
+
+def replace_placeholders_in_doc(doc: Document, values: Dict[str, str]) -> None:
+    for p in doc.paragraphs:
+        _replace_placeholders_in_paragraph(p, values)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _replace_placeholders_in_paragraph(p, values)
+
+
+def fill_expense_table_if_present(doc: Document, expenses: List[Dict[str, Any]]) -> bool:
+    """
+    If the template contains a table where the header row has any of:
+    Date, Category, Description, Paid By, Amount
+    then it will wipe existing body rows and insert expenses.
+    """
+    expected = {"date", "category", "description", "paid by", "paid_by", "amount"}
+
+    for table in doc.tables:
+        if len(table.rows) < 1:
+            continue
+
+        header_cells = [c.text.strip().lower() for c in table.rows[0].cells]
+        header_set = set(header_cells)
+
+        if not (expected & header_set):
+            continue
+
+        # Remove all rows except header
+        while len(table.rows) > 1:
+            table._tbl.remove(table.rows[1]._tr)
+
+        for e in expenses:
+            row_cells = table.add_row().cells
+            mapping = {
+                "date": str(e.get("expense_date", "")),
+                "category": str(e.get("category", "")),
+                "description": str(e.get("description", "")),
+                "paid by": str(e.get("paid_by", "")),
+                "paid_by": str(e.get("paid_by", "")),
+                "amount": f"{float(e.get('amount') or 0):,.2f}",
+            }
+
+            for i, h in enumerate(header_cells):
+                h_clean = h.strip().lower()
+                if h_clean in mapping and i < len(row_cells):
+                    row_cells[i].text = mapping[h_clean]
+
+        return True
+
+    return False
+
+
+def insert_expense_table_at_marker(doc: Document, expenses: List[Dict[str, Any]], marker: str = "{{EXPENSE_TABLE}}") -> bool:
+    """
+    If the template contains a paragraph with {{EXPENSE_TABLE}},
+    replace it by inserting a table right after it.
+    """
+    for i, p in enumerate(doc.paragraphs):
+        if marker in p.text:
+            p.text = p.text.replace(marker, "").strip()
+
+            table = doc.add_table(rows=1, cols=5)
+            hdr = table.rows[0].cells
+            hdr[0].text = "Date"
+            hdr[1].text = "Category"
+            hdr[2].text = "Description"
+            hdr[3].text = "Paid By"
+            hdr[4].text = "Amount"
+
+            for e in expenses:
+                cells = table.add_row().cells
+                cells[0].text = str(e.get("expense_date", ""))
+                cells[1].text = str(e.get("category", ""))
+                cells[2].text = str(e.get("description", ""))
+                cells[3].text = str(e.get("paid_by", ""))
+                cells[4].text = f"{float(e.get('amount') or 0):,.2f}"
+
+            doc._body._body.insert(i + 1, table._tbl)
+            return True
+
+    return False
+
+
+def build_nn_docx_bytes(
+    template_path: str,
+    trip_info: Dict[str, Any],
+    expenses: List[Dict[str, Any]],
+) -> bytes:
+    """
+    Loads NN template docx, replaces placeholders, fills expense table, returns bytes.
+    """
+    values = {
+        "EMPLOYEE_NAME": str(trip_info.get("employee_name", "")),
+        "EMPLOYEE_EMAIL": str(trip_info.get("employee_email", "")),
+        "LOCATION": str(trip_info.get("location", "")),
+        "PURPOSE": str(trip_info.get("purpose", "")),
+        "DEPARTURE_DATE": str(trip_info.get("departure_date", "")),
+        "RETURN_DATE": str(trip_info.get("return_date", "")),
+        "TRIP_DAYS": str(trip_info.get("trip_days", "")),
+        "PER_DIEM_RATE": f"{float(trip_info.get('per_diem_rate') or 0):,.2f}",
+        "PER_DIEM_TOTAL": f"{float(trip_info.get('per_diem_total') or 0):,.2f}",
+        "TOTAL_SPEND": f"{float(trip_info.get('total_spend') or 0):,.2f}",
+        "COMPANY_PAID": f"{float(trip_info.get('company_paid') or 0):,.2f}",
+        "EMPLOYEE_PAID": f"{float(trip_info.get('employee_paid') or 0):,.2f}",
+        "REIMBURSEMENT_DUE": f"{float(trip_info.get('reimbursement_due') or 0):,.2f}",
+        "REPORT_DATE": str(date.today()),
+    }
+
+    doc = Document(template_path)
+    replace_placeholders_in_doc(doc, values)
+
+    # Fill a pre-existing table if present, otherwise insert at marker if present
+    filled = fill_expense_table_if_present(doc, expenses)
+    if not filled:
+        insert_expense_table_at_marker(doc, expenses, marker="{{EXPENSE_TABLE}}")
+
+    bio = BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
+
+# -----------------------------
 # App state
 # -----------------------------
 if "expenses" not in st.session_state:
@@ -230,7 +387,30 @@ if "expenses" not in st.session_state:
 # UI
 # -----------------------------
 st.title("Performa Expense Report")
-st.caption("Phase 1, generates Excel plus receipts, emails Finance, Approver, and Employee archive.")
+st.caption("Phase 1, generates Excel plus receipts for Guam, generates populated NN DOCX plus receipts for NN, emails Finance, Approver, and Employee archive.")
+
+# Selector: Guam vs NN
+st.subheader("Report Type")
+report_type = st.radio(
+    "Select report type",
+    ["Guam", "NN (Navajo Nation)"],
+    horizontal=True,
+)
+
+# If NN, show template selector (does not affect Guam behavior)
+selected_nn_template = None
+templates = []
+if report_type == "NN (Navajo Nation)":
+    templates = list_docx_templates()
+    if not templates:
+        st.warning("No .docx templates found in the templates folder. Add the NN template to /templates in your repo.")
+    else:
+        default_idx = 0
+        for idx, t in enumerate(templates):
+            if "navajo" in t.lower() or re.search(r"\bnn\b", t.lower()):
+                default_idx = idx
+                break
+        selected_nn_template = st.selectbox("Select NN Template", templates, index=default_idx)
 
 st.subheader("Trip Information")
 
@@ -333,7 +513,7 @@ else:
 st.divider()
 
 st.caption(
-    f"Attachment limit enforced at {MAX_ATTACHMENT_MB:,.0f} MB total for receipts plus the Excel file."
+    f"Attachment limit enforced at {MAX_ATTACHMENT_MB:,.0f} MB total for receipts plus the report file."
 )
 
 submit = st.button("Submit Expense Report", type="primary")
@@ -353,11 +533,15 @@ if submit:
     if return_date < departure_date:
         missing.append("Return Date must be on or after Departure Date")
 
+    if report_type == "NN (Navajo Nation)":
+        if not selected_nn_template:
+            missing.append("NN Template selection")
+
     if missing:
         st.error("Please complete the following fields: " + ", ".join(missing))
         st.stop()
 
-    # Build Excel
+    # Trip info object (used by both Guam and NN paths)
     trip_info = {
         "employee_name": employee_name,
         "employee_email": employee_email,
@@ -374,20 +558,48 @@ if submit:
         "reimbursement_due": reimbursement_due,
     }
 
-    # generate_excel should return bytes
-    excel_bytes = generate_excel(trip_info, st.session_state.expenses)
-
-    # Prepare attachments: Excel + receipts
+    # Prepare attachments: Guam uses Excel, NN uses populated DOCX, receipts always included
     attachments: List[Dict[str, Any]] = []
-    attachments.append(
-        {
-            "filename": f"Expense_Report_{employee_name.replace(' ', '_')}.xlsx",
-            "content_bytes": excel_bytes,
-            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        }
-    )
 
-    # Receipts
+    if report_type == "Guam":
+        # -----------------------------
+        # Guam flow, unchanged
+        # -----------------------------
+        # generate_excel should return bytes
+        excel_bytes = generate_excel(trip_info, st.session_state.expenses)
+
+        attachments.append(
+            {
+                "filename": f"Expense_Report_{employee_name.replace(' ', '_')}.xlsx",
+                "content_bytes": excel_bytes,
+                "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            }
+        )
+
+    else:
+        # -----------------------------
+        # NN flow, populate template docx
+        # -----------------------------
+        template_path = os.path.join(TEMPLATES_DIR, selected_nn_template)
+        try:
+            nn_docx_bytes = build_nn_docx_bytes(
+                template_path=template_path,
+                trip_info=trip_info,
+                expenses=st.session_state.expenses,
+            )
+        except Exception as ex:
+            st.error(f"Failed to populate NN template: {ex}")
+            st.stop()
+
+        attachments.append(
+            {
+                "filename": f"NN_Expense_Report_{employee_name.replace(' ', '_')}.docx",
+                "content_bytes": nn_docx_bytes,
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            }
+        )
+
+    # Receipts (unchanged logic)
     for i, e in enumerate(st.session_state.expenses, start=1):
         f = e.get("receipt_file")
         if f is None:
@@ -418,11 +630,16 @@ if submit:
         )
         st.stop()
 
-    # Email content
+    # Email content (same HTML body used for both)
     subject = (
         f"Expense Report Submitted, {employee_name}, {location}, "
         f"{departure_date} to {return_date}"
     )
+    if report_type == "NN (Navajo Nation)":
+        subject = (
+            f"NN Expense Report Submitted, {employee_name}, {location}, "
+            f"{departure_date} to {return_date}"
+        )
 
     html_body = build_email_html(
         employee_name=employee_name,
