@@ -33,9 +33,9 @@ MAX_ATTACHMENT_MB = float(st.secrets.get("MAX_ATTACHMENT_MB", 18))
 
 TEMPLATES_DIR = "templates"
 NN_TEMPLATE_FILENAME = "nn_templates.xlsx"
-NN_SHEET_NAME = "Traveler Expense"
+NN_SHEET_NAME_DEFAULT = "Traveler Expense"
 
-# NN daily grid settings per your confirmation
+# NN daily grid settings
 NN_START_ROW = 3
 NN_COL_DATE = 1          # A
 NN_COL_BREAKFAST = 2     # B (do not change)
@@ -233,8 +233,6 @@ def _each_date_inclusive(start_d: date, end_d: date):
 
 
 def _add_amount_to_cell(ws, row: int, col: int, amount: float) -> None:
-    if amount is None:
-        return
     amt = float(amount or 0)
     if amt == 0:
         return
@@ -257,22 +255,42 @@ def _append_note(ws, row: int, note: str) -> None:
         cell.value = note
 
 
+def _normalize_sheet_name(name: str) -> str:
+    # Trim, collapse whitespace, lower
+    parts = str(name or "").strip().split()
+    return " ".join(parts).lower()
+
+
 def generate_nn_excel_bytes(
     employee_name: str,
     departure_date: date,
     return_date: date,
     per_diem_rate: float,
     expenses: List[Dict[str, Any]],
+    sheet_name: str,
 ) -> bytes:
     template_path = os.path.join(TEMPLATES_DIR, NN_TEMPLATE_FILENAME)
     if not os.path.exists(template_path):
         raise FileNotFoundError(f"NN template not found at {template_path}")
 
     wb = load_workbook(template_path)
-    if NN_SHEET_NAME not in wb.sheetnames:
-        raise ValueError(f"Sheet '{NN_SHEET_NAME}' not found in NN template")
 
-    ws = wb[NN_SHEET_NAME]
+    # Resolve sheet by exact name first, then normalized match
+    resolved_sheet = None
+    if sheet_name in wb.sheetnames:
+        resolved_sheet = sheet_name
+    else:
+        target_norm = _normalize_sheet_name(sheet_name)
+        for s in wb.sheetnames:
+            if _normalize_sheet_name(s) == target_norm:
+                resolved_sheet = s
+                break
+
+    if not resolved_sheet:
+        available = ", ".join(wb.sheetnames)
+        raise ValueError(f"Sheet not found. Available sheets: {available}")
+
+    ws = wb[resolved_sheet]
 
     # Employee name in A1
     ws["A1"].value = employee_name
@@ -287,8 +305,6 @@ def generate_nn_excel_bytes(
         date_to_row[d] = r
         r += 1
 
-    # Map Streamlit categories to NN columns
-    # Notes: Gas for Rental Car and Other travel type items go to Misc Travel (J)
     category_to_col = {
         "Airfare": NN_COL_AIRFARE,
         "Hotel": NN_COL_LODGING,
@@ -299,7 +315,6 @@ def generate_nn_excel_bytes(
         "Other": NN_COL_MISC_TRAVEL,
     }
 
-    # Place expenses into the grid by date and category
     for e in expenses:
         d = e.get("expense_date")
         if not isinstance(d, date):
@@ -312,15 +327,12 @@ def generate_nn_excel_bytes(
             continue
 
         cat = str(e.get("category") or "")
-        col = category_to_col.get(cat)
-        if col is None:
-            col = NN_COL_MISC_TRAVEL
+        col = category_to_col.get(cat, NN_COL_MISC_TRAVEL)
 
         _add_amount_to_cell(ws, row, col, float(e.get("amount") or 0))
 
         desc = str(e.get("description") or "").strip()
         paid_by = str(e.get("paid_by") or "").strip()
-        note = ""
         if desc and paid_by:
             note = f"{cat}: {desc} (Paid by {paid_by})"
         elif desc:
@@ -356,6 +368,28 @@ report_type = st.radio(
     ["Guam", "NN (Navajo Nation)"],
     horizontal=True,
 )
+
+# If NN, load workbook sheetnames and let user choose
+nn_sheet_choice = NN_SHEET_NAME_DEFAULT
+if report_type == "NN (Navajo Nation)":
+    template_path_ui = os.path.join(TEMPLATES_DIR, NN_TEMPLATE_FILENAME)
+    if not os.path.exists(template_path_ui):
+        st.error(f"NN template file not found at {template_path_ui}")
+    else:
+        try:
+            wb_ui = load_workbook(template_path_ui, read_only=True)
+            sheetnames = wb_ui.sheetnames
+            wb_ui.close()
+            # Try to default to normalized match of "Traveler Expense"
+            default_idx = 0
+            target_norm = _normalize_sheet_name(NN_SHEET_NAME_DEFAULT)
+            for i, s in enumerate(sheetnames):
+                if _normalize_sheet_name(s) == target_norm:
+                    default_idx = i
+                    break
+            nn_sheet_choice = st.selectbox("NN Sheet", sheetnames, index=default_idx)
+        except Exception as ex:
+            st.error(f"Unable to read NN template sheets: {ex}")
 
 st.subheader("Trip Information")
 
@@ -475,6 +509,12 @@ if submit:
     if return_date < departure_date:
         missing.append("Return Date must be on or after Departure Date")
 
+    if report_type == "NN (Navajo Nation)":
+        # Ensure template exists
+        template_path_check = os.path.join(TEMPLATES_DIR, NN_TEMPLATE_FILENAME)
+        if not os.path.exists(template_path_check):
+            missing.append(f"NN template file missing: {template_path_check}")
+
     if missing:
         st.error("Please complete the following fields: " + ", ".join(missing))
         st.stop()
@@ -498,7 +538,7 @@ if submit:
     attachments: List[Dict[str, Any]] = []
 
     if report_type == "Guam":
-        # Guam flow is unchanged
+        # Guam flow unchanged
         excel_bytes = generate_excel(trip_info, st.session_state.expenses)
         attachments.append(
             {
@@ -508,7 +548,7 @@ if submit:
             }
         )
     else:
-        # NN flow uses NN template
+        # NN flow uses template and selected sheet
         try:
             nn_bytes = generate_nn_excel_bytes(
                 employee_name=employee_name,
@@ -516,6 +556,7 @@ if submit:
                 return_date=return_date,
                 per_diem_rate=PER_DIEM_RATE,
                 expenses=st.session_state.expenses,
+                sheet_name=nn_sheet_choice,
             )
         except Exception as ex:
             st.error(f"NN report generation failed: {ex}")
