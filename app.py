@@ -19,6 +19,7 @@ from sendgrid.helpers.mail import (
 )
 
 from openpyxl import load_workbook
+from openpyxl.cell.cell import Cell
 
 from excel_generator import generate_excel
 
@@ -47,12 +48,14 @@ NN_COL_DATE = 1          # A
 NN_COL_BREAKFAST = 2     # B (do not change)
 NN_COL_LUNCH = 3         # C (do not change)
 NN_COL_DINNER = 4        # D (do not change)
-NN_COL_INCIDENTALS = 5   # E (per diem goes here)
+NN_COL_INCIDENTALS = 5   # E (we set per diem here, 51 or 68)
 NN_COL_AIRFARE = 6       # F
 NN_COL_LODGING = 7       # G
 NN_COL_VEHICLE_MILEAGE = 8  # H (not used from current UI)
 NN_COL_RENTAL_CAR = 9    # I
 NN_COL_MISC_TRAVEL = 10  # J
+NN_COL_MIE_TOTALS = 11   # K (formula)
+NN_COL_MIE_MAX = 12      # L (formula)
 NN_COL_NOTES = 13        # M
 
 CATEGORIES = [
@@ -243,18 +246,64 @@ def _normalize_sheet_name(name: str) -> str:
     return " ".join(parts).lower()
 
 
-def _add_amount_to_cell(ws, row: int, col: int, amount: float) -> None:
-    amt = float(amount or 0)
-    existing = ws.cell(row=row, column=col).value
+def _safe_float(val) -> float:
     try:
-        existing_float = float(existing or 0)
+        return float(val or 0)
     except Exception:
-        existing_float = 0.0
-    ws.cell(row=row, column=col).value = existing_float + amt
+        return 0.0
+
+
+def _copy_cell_style_and_formula(src: Cell, dst: Cell) -> None:
+    # Copy style
+    dst._style = src._style
+    dst.number_format = src.number_format
+    dst.font = src.font
+    dst.fill = src.fill
+    dst.border = src.border
+    dst.alignment = src.alignment
+    dst.protection = src.protection
+
+    # Copy formula or value as-is
+    if isinstance(src.value, str) and src.value.startswith("="):
+        dst.value = src.value
+    else:
+        dst.value = src.value
+
+
+def _copy_row(ws, src_row: int, dst_row: int, min_col: int, max_col: int) -> None:
+    for c in range(min_col, max_col + 1):
+        src = ws.cell(row=src_row, column=c)
+        dst = ws.cell(row=dst_row, column=c)
+        _copy_cell_style_and_formula(src, dst)
+
+
+def _find_last_prefilled_row(ws) -> int:
+    """
+    Finds the last row in the template daily grid that already has a table row style.
+    We scan downward from NN_START_ROW until we hit a completely empty DATE cell.
+    We return the last row that is part of the existing template band.
+    """
+    r = NN_START_ROW
+    last = NN_START_ROW
+    # Scan a reasonable window
+    for _ in range(0, 60):
+        v = ws.cell(row=r, column=NN_COL_DATE).value
+        if v is None or str(v).strip() == "":
+            break
+        last = r
+        r += 1
+    return last
 
 
 def _set_zero(ws, row: int, col: int) -> None:
     ws.cell(row=row, column=col).value = 0.0
+
+
+def _add_amount_to_cell(ws, row: int, col: int, amount: float) -> None:
+    amt = float(amount or 0)
+    existing = ws.cell(row=row, column=col).value
+    existing_float = _safe_float(existing)
+    ws.cell(row=row, column=col).value = existing_float + amt
 
 
 def _append_note(ws, row: int, note: str) -> None:
@@ -281,10 +330,6 @@ def _find_cell_by_exact_text(ws, target_text: str) -> Optional[Tuple[int, int]]:
 
 
 def _write_killol_notes_values(ws, values: Dict[str, float]) -> None:
-    """
-    Writes values into the "For Killol's Notes" block by locating each label
-    and writing the numeric value into the cell immediately to the left.
-    """
     for label, amount in values.items():
         pos = _find_cell_by_exact_text(ws, label)
         if not pos:
@@ -295,18 +340,18 @@ def _write_killol_notes_values(ws, values: Dict[str, float]) -> None:
         ws.cell(row=r, column=c - 1).value = float(amount)
 
 
+def calc_nn_per_diem_for_day(d: date, departure_date: date, return_date: date) -> float:
+    if d == departure_date or d == return_date:
+        return float(NN_TRAVEL_DAY_RATE)
+    return float(NN_NON_TRAVEL_DAY_RATE)
+
+
 def calc_nn_per_diem_total(departure_date: date, return_date: date) -> float:
     if return_date < departure_date:
         return 0.0
-    if return_date == departure_date:
-        return float(NN_TRAVEL_DAY_RATE)
-
     total = 0.0
     for d in _each_date_inclusive(departure_date, return_date):
-        if d == departure_date or d == return_date:
-            total += float(NN_TRAVEL_DAY_RATE)
-        else:
-            total += float(NN_NON_TRAVEL_DAY_RATE)
+        total += calc_nn_per_diem_for_day(d, departure_date, return_date)
     return total
 
 
@@ -342,30 +387,39 @@ def generate_nn_excel_bytes(
     # Employee name in A1
     ws["A1"].value = employee_name
 
-    # Build date -> row mapping and initialize numeric fields to 0.00
+    # Identify the last template row with formulas/formatting
+    template_last_row = _find_last_prefilled_row(ws)
+
+    # Build date -> row mapping and ensure formulas exist for all rows we will use
     date_to_row: Dict[date, int] = {}
     r = NN_START_ROW
+
     for d in _each_date_inclusive(departure_date, return_date):
+        # If this row is beyond the prebuilt template band, copy the last template row into it
+        if r > template_last_row:
+            # Copy A through M formatting and formulas, so K and L formulas exist
+            _copy_row(ws, template_last_row, r, 1, NN_COL_NOTES)
+
+        # Set date
         ws.cell(row=r, column=NN_COL_DATE).value = d
 
-        # Breakfast/Lunch/Dinner untouched by request.
+        # Per diem goes only in Incidentals
+        ws.cell(row=r, column=NN_COL_INCIDENTALS).value = calc_nn_per_diem_for_day(d, departure_date, return_date)
 
-        # Incidentals per diem: 51 on travel days, 68 on non travel days
-        if d == departure_date or d == return_date:
-            ws.cell(row=r, column=NN_COL_INCIDENTALS).value = float(NN_TRAVEL_DAY_RATE)
-        else:
-            ws.cell(row=r, column=NN_COL_INCIDENTALS).value = float(NN_NON_TRAVEL_DAY_RATE)
-
-        # All other spend columns start at 0 unless employee enters an expense
+        # All spend columns start at 0 unless employee enters an expense
         _set_zero(ws, r, NN_COL_AIRFARE)
         _set_zero(ws, r, NN_COL_LODGING)
         _set_zero(ws, r, NN_COL_VEHICLE_MILEAGE)
         _set_zero(ws, r, NN_COL_RENTAL_CAR)
         _set_zero(ws, r, NN_COL_MISC_TRAVEL)
 
+        # Notes blank by default
+        ws.cell(row=r, column=NN_COL_NOTES).value = ""
+
         date_to_row[d] = r
         r += 1
 
+    # Map Streamlit categories to NN columns
     category_to_col = {
         "Airfare": NN_COL_AIRFARE,
         "Hotel": NN_COL_LODGING,
@@ -380,8 +434,6 @@ def generate_nn_excel_bytes(
     company_paid_hotel = 0.0
     company_paid_total = 0.0
     employee_paid_total = 0.0
-
-    # Optional heuristic for "Market at hotel" on company card
     company_paid_market_at_hotel = 0.0
 
     for e in expenses:
@@ -399,7 +451,8 @@ def generate_nn_excel_bytes(
         col = category_to_col.get(cat, NN_COL_MISC_TRAVEL)
 
         amt = float(e.get("amount") or 0)
-        _add_amount_to_cell(ws, row, col, amt)
+        if amt != 0:
+            _add_amount_to_cell(ws, row, col, amt)
 
         paid_by = str(e.get("paid_by") or "").strip()
         desc = str(e.get("description") or "").strip()
@@ -413,8 +466,7 @@ def generate_nn_excel_bytes(
         else:
             employee_paid_total += amt
 
-        # Notes column
-        note = ""
+        # Notes
         if desc and paid_by:
             note = f"{cat}: {desc} (Paid by {paid_by})"
         elif desc:
@@ -425,22 +477,23 @@ def generate_nn_excel_bytes(
             note = f"{cat}"
         _append_note(ws, row, note)
 
-    # NN per diem totals based on rules
+    # Per diem totals based on rules
     nn_per_diem_total = calc_nn_per_diem_total(departure_date, return_date)
 
-    # Total expense report in sheet terms: per diem incidentals plus all expenses entered
+    # Total expense report: per diem plus all entered expenses
     total_expense_report = nn_per_diem_total + company_paid_total + employee_paid_total
 
+    # Amount due to employee: per diem plus any out of pocket
     amount_due_to_employee = nn_per_diem_total + employee_paid_total
+
+    # Amount due to Performa: company paid total
     amount_due_to_performa = company_paid_total
 
-    # "For Killol's Notes" labels as seen in your screenshot
-    # We write amounts to the cell immediately left of each label, if found
     killol_values = {
         "Total Expense Report": total_expense_report,
         "Amout Charged to Performa Card for Hotel": company_paid_hotel,
         "Amout for Hotel only on Performa Card": company_paid_hotel,
-        "Amount for Market at hotel on Performa Card": company_paid_market_at_hotel,
+        "Amout for Market at hotel on Performa Card": company_paid_market_at_hotel,
         "Amount due to Brian*": amount_due_to_employee,
         "Amount due to Performa": amount_due_to_performa,
     }
@@ -471,7 +524,7 @@ report_type = st.radio(
     horizontal=True,
 )
 
-# If NN, load workbook sheetnames and let user choose
+# NN sheet chooser
 nn_sheet_choice = NN_SHEET_NAME_DEFAULT
 if report_type == "NN (Navajo Nation)":
     template_path_ui = os.path.join(TEMPLATES_DIR, NN_TEMPLATE_FILENAME)
