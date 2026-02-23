@@ -2,7 +2,7 @@ import base64
 import os
 from datetime import date, timedelta
 from io import BytesIO
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 from sendgrid import SendGridAPIClient
@@ -28,7 +28,13 @@ from excel_generator import generate_excel
 # -----------------------------
 st.set_page_config(page_title="Performa Expense Report", layout="wide")
 
+# Guam per diem rate, unchanged
 PER_DIEM_RATE = float(st.secrets.get("PER_DIEM_RATE", 100))
+
+# NN per diem rates
+NN_TRAVEL_DAY_RATE = float(st.secrets.get("NN_TRAVEL_DAY_RATE", 51))
+NN_NON_TRAVEL_DAY_RATE = float(st.secrets.get("NN_NON_TRAVEL_DAY_RATE", 68))
+
 MAX_ATTACHMENT_MB = float(st.secrets.get("MAX_ATTACHMENT_MB", 18))
 
 TEMPLATES_DIR = "templates"
@@ -232,16 +238,23 @@ def _each_date_inclusive(start_d: date, end_d: date):
         cur = cur + timedelta(days=1)
 
 
+def _normalize_sheet_name(name: str) -> str:
+    parts = str(name or "").strip().split()
+    return " ".join(parts).lower()
+
+
 def _add_amount_to_cell(ws, row: int, col: int, amount: float) -> None:
     amt = float(amount or 0)
-    if amt == 0:
-        return
     existing = ws.cell(row=row, column=col).value
     try:
         existing_float = float(existing or 0)
     except Exception:
         existing_float = 0.0
     ws.cell(row=row, column=col).value = existing_float + amt
+
+
+def _set_zero(ws, row: int, col: int) -> None:
+    ws.cell(row=row, column=col).value = 0.0
 
 
 def _append_note(ws, row: int, note: str) -> None:
@@ -255,17 +268,52 @@ def _append_note(ws, row: int, note: str) -> None:
         cell.value = note
 
 
-def _normalize_sheet_name(name: str) -> str:
-    # Trim, collapse whitespace, lower
-    parts = str(name or "").strip().split()
-    return " ".join(parts).lower()
+def _find_cell_by_exact_text(ws, target_text: str) -> Optional[Tuple[int, int]]:
+    t = str(target_text).strip()
+    for row in ws.iter_rows(values_only=False):
+        for cell in row:
+            v = cell.value
+            if v is None:
+                continue
+            if str(v).strip() == t:
+                return (cell.row, cell.column)
+    return None
+
+
+def _write_killol_notes_values(ws, values: Dict[str, float]) -> None:
+    """
+    Writes values into the "For Killol's Notes" block by locating each label
+    and writing the numeric value into the cell immediately to the left.
+    """
+    for label, amount in values.items():
+        pos = _find_cell_by_exact_text(ws, label)
+        if not pos:
+            continue
+        r, c = pos
+        if c <= 1:
+            continue
+        ws.cell(row=r, column=c - 1).value = float(amount)
+
+
+def calc_nn_per_diem_total(departure_date: date, return_date: date) -> float:
+    if return_date < departure_date:
+        return 0.0
+    if return_date == departure_date:
+        return float(NN_TRAVEL_DAY_RATE)
+
+    total = 0.0
+    for d in _each_date_inclusive(departure_date, return_date):
+        if d == departure_date or d == return_date:
+            total += float(NN_TRAVEL_DAY_RATE)
+        else:
+            total += float(NN_NON_TRAVEL_DAY_RATE)
+    return total
 
 
 def generate_nn_excel_bytes(
     employee_name: str,
     departure_date: date,
     return_date: date,
-    per_diem_rate: float,
     expenses: List[Dict[str, Any]],
     sheet_name: str,
 ) -> bytes:
@@ -275,7 +323,6 @@ def generate_nn_excel_bytes(
 
     wb = load_workbook(template_path)
 
-    # Resolve sheet by exact name first, then normalized match
     resolved_sheet = None
     if sheet_name in wb.sheetnames:
         resolved_sheet = sheet_name
@@ -295,13 +342,27 @@ def generate_nn_excel_bytes(
     # Employee name in A1
     ws["A1"].value = employee_name
 
-    # Build date -> row mapping for trip dates
+    # Build date -> row mapping and initialize numeric fields to 0.00
     date_to_row: Dict[date, int] = {}
     r = NN_START_ROW
     for d in _each_date_inclusive(departure_date, return_date):
         ws.cell(row=r, column=NN_COL_DATE).value = d
-        # Only Incidentals gets per diem, Breakfast Lunch Dinner are untouched
-        ws.cell(row=r, column=NN_COL_INCIDENTALS).value = float(per_diem_rate)
+
+        # Breakfast/Lunch/Dinner untouched by request.
+
+        # Incidentals per diem: 51 on travel days, 68 on non travel days
+        if d == departure_date or d == return_date:
+            ws.cell(row=r, column=NN_COL_INCIDENTALS).value = float(NN_TRAVEL_DAY_RATE)
+        else:
+            ws.cell(row=r, column=NN_COL_INCIDENTALS).value = float(NN_NON_TRAVEL_DAY_RATE)
+
+        # All other spend columns start at 0 unless employee enters an expense
+        _set_zero(ws, r, NN_COL_AIRFARE)
+        _set_zero(ws, r, NN_COL_LODGING)
+        _set_zero(ws, r, NN_COL_VEHICLE_MILEAGE)
+        _set_zero(ws, r, NN_COL_RENTAL_CAR)
+        _set_zero(ws, r, NN_COL_MISC_TRAVEL)
+
         date_to_row[d] = r
         r += 1
 
@@ -314,6 +375,14 @@ def generate_nn_excel_bytes(
         "Taxi or Uber to Airport": NN_COL_MISC_TRAVEL,
         "Other": NN_COL_MISC_TRAVEL,
     }
+
+    # Track for Killol notes
+    company_paid_hotel = 0.0
+    company_paid_total = 0.0
+    employee_paid_total = 0.0
+
+    # Optional heuristic for "Market at hotel" on company card
+    company_paid_market_at_hotel = 0.0
 
     for e in expenses:
         d = e.get("expense_date")
@@ -329,10 +398,23 @@ def generate_nn_excel_bytes(
         cat = str(e.get("category") or "")
         col = category_to_col.get(cat, NN_COL_MISC_TRAVEL)
 
-        _add_amount_to_cell(ws, row, col, float(e.get("amount") or 0))
+        amt = float(e.get("amount") or 0)
+        _add_amount_to_cell(ws, row, col, amt)
 
-        desc = str(e.get("description") or "").strip()
         paid_by = str(e.get("paid_by") or "").strip()
+        desc = str(e.get("description") or "").strip()
+
+        if paid_by == "Performa":
+            company_paid_total += amt
+            if cat == "Hotel":
+                company_paid_hotel += amt
+            if "market" in desc.lower():
+                company_paid_market_at_hotel += amt
+        else:
+            employee_paid_total += amt
+
+        # Notes column
+        note = ""
         if desc and paid_by:
             note = f"{cat}: {desc} (Paid by {paid_by})"
         elif desc:
@@ -341,8 +423,28 @@ def generate_nn_excel_bytes(
             note = f"{cat} (Paid by {paid_by})"
         else:
             note = f"{cat}"
-
         _append_note(ws, row, note)
+
+    # NN per diem totals based on rules
+    nn_per_diem_total = calc_nn_per_diem_total(departure_date, return_date)
+
+    # Total expense report in sheet terms: per diem incidentals plus all expenses entered
+    total_expense_report = nn_per_diem_total + company_paid_total + employee_paid_total
+
+    amount_due_to_employee = nn_per_diem_total + employee_paid_total
+    amount_due_to_performa = company_paid_total
+
+    # "For Killol's Notes" labels as seen in your screenshot
+    # We write amounts to the cell immediately left of each label, if found
+    killol_values = {
+        "Total Expense Report": total_expense_report,
+        "Amout Charged to Performa Card for Hotel": company_paid_hotel,
+        "Amout for Hotel only on Performa Card": company_paid_hotel,
+        "Amount for Market at hotel on Performa Card": company_paid_market_at_hotel,
+        "Amount due to Brian*": amount_due_to_employee,
+        "Amount due to Performa": amount_due_to_performa,
+    }
+    _write_killol_notes_values(ws, killol_values)
 
     out = BytesIO()
     wb.save(out)
@@ -380,7 +482,7 @@ if report_type == "NN (Navajo Nation)":
             wb_ui = load_workbook(template_path_ui, read_only=True)
             sheetnames = wb_ui.sheetnames
             wb_ui.close()
-            # Try to default to normalized match of "Traveler Expense"
+
             default_idx = 0
             target_norm = _normalize_sheet_name(NN_SHEET_NAME_DEFAULT)
             for i, s in enumerate(sheetnames):
@@ -408,8 +510,16 @@ with col4:
     return_date = st.date_input("Return Date", value=date.today())
 
 trip_days = calc_trip_days(departure_date, return_date)
-per_diem_total = PER_DIEM_RATE * trip_days
-st.info(f"Per diem is ${PER_DIEM_RATE:,.0f} per day, {trip_days} day(s), total ${per_diem_total:,.2f}")
+
+if report_type == "Guam":
+    per_diem_total_display = PER_DIEM_RATE * trip_days
+    st.info(f"Per diem is ${PER_DIEM_RATE:,.0f} per day, {trip_days} day(s), total ${per_diem_total_display:,.2f}")
+else:
+    per_diem_total_display = calc_nn_per_diem_total(departure_date, return_date)
+    st.info(
+        f"NN per diem is ${NN_TRAVEL_DAY_RATE:,.0f} on travel days and ${NN_NON_TRAVEL_DAY_RATE:,.0f} on non travel days, "
+        f"{trip_days} day(s), total ${per_diem_total_display:,.2f}"
+    )
 
 st.subheader("Expenses")
 
@@ -453,7 +563,7 @@ total_spend = totals["total_spend"]
 company_paid = totals["company_paid"]
 employee_paid = totals["employee_paid"]
 
-reimbursement_due = per_diem_total + employee_paid
+reimbursement_due = per_diem_total_display + employee_paid
 
 s1, s2, s3, s4 = st.columns(4)
 s1.metric("Total Spend", f"${total_spend:,.2f}")
@@ -510,7 +620,6 @@ if submit:
         missing.append("Return Date must be on or after Departure Date")
 
     if report_type == "NN (Navajo Nation)":
-        # Ensure template exists
         template_path_check = os.path.join(TEMPLATES_DIR, NN_TEMPLATE_FILENAME)
         if not os.path.exists(template_path_check):
             missing.append(f"NN template file missing: {template_path_check}")
@@ -519,6 +628,7 @@ if submit:
         st.error("Please complete the following fields: " + ", ".join(missing))
         st.stop()
 
+    # Trip info used by Guam generator, unchanged behavior
     trip_info = {
         "employee_name": employee_name,
         "employee_email": employee_email,
@@ -528,11 +638,11 @@ if submit:
         "return_date": return_date,
         "trip_days": trip_days,
         "per_diem_rate": PER_DIEM_RATE,
-        "per_diem_total": per_diem_total,
+        "per_diem_total": (PER_DIEM_RATE * trip_days),
         "total_spend": total_spend,
         "company_paid": company_paid,
         "employee_paid": employee_paid,
-        "reimbursement_due": reimbursement_due,
+        "reimbursement_due": (PER_DIEM_RATE * trip_days) + employee_paid,
     }
 
     attachments: List[Dict[str, Any]] = []
@@ -554,7 +664,6 @@ if submit:
                 employee_name=employee_name,
                 departure_date=departure_date,
                 return_date=return_date,
-                per_diem_rate=PER_DIEM_RATE,
                 expenses=st.session_state.expenses,
                 sheet_name=nn_sheet_choice,
             )
@@ -614,7 +723,7 @@ if submit:
         purpose=purpose,
         departure_date=departure_date,
         return_date=return_date,
-        per_diem_total=per_diem_total,
+        per_diem_total=per_diem_total_display,
         total_spend=total_spend,
         company_paid=company_paid,
         employee_paid=employee_paid,
