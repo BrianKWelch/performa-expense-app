@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 from datetime import date, timedelta
 from io import BytesIO
 from typing import List, Dict, Any, Optional, Tuple
@@ -47,10 +48,10 @@ NN_COL_DATE = 1          # A
 NN_COL_BREAKFAST = 2     # B (do not change)
 NN_COL_LUNCH = 3         # C (do not change)
 NN_COL_DINNER = 4        # D (do not change)
-NN_COL_INCIDENTALS = 5   # E (we set per diem here, 51 or 68)
+NN_COL_INCIDENTALS = 5   # E (we set per diem here)
 NN_COL_AIRFARE = 6       # F
 NN_COL_LODGING = 7       # G
-NN_COL_VEHICLE_MILEAGE = 8  # H (not used from current UI)
+NN_COL_VEHICLE_MILEAGE = 8  # H (not used)
 NN_COL_RENTAL_CAR = 9    # I
 NN_COL_MISC_TRAVEL = 10  # J
 NN_COL_MIE_TOTALS = 11   # K (formula)
@@ -298,10 +299,6 @@ def _write_killol_notes_values(ws, values: Dict[str, float]) -> None:
 
 
 def _find_template_last_row(ws) -> int:
-    """
-    Finds the last prebuilt daily row in the template.
-    We scan downward from NN_START_ROW until the DATE cell is empty.
-    """
     r = NN_START_ROW
     last = NN_START_ROW
     for _ in range(0, 60):
@@ -313,15 +310,35 @@ def _find_template_last_row(ws) -> int:
     return last
 
 
-def _copy_formulas_only(ws, src_row: int, dst_row: int, min_col: int, max_col: int) -> None:
+_CELL_REF_RE = re.compile(r"(\$?[A-Z]{1,3})(\$?)(\d+)")
+
+
+def _rewrite_formula_row_refs(formula: str, src_row: int, dst_row: int) -> str:
     """
-    Copies only formulas (cell values that start with '=') from src_row into dst_row.
-    No styles, no formatting, no StyleProxy issues.
+    Updates cell refs in a formula so any reference to src_row becomes dst_row.
+    Examples:
+      B6 -> B7
+      $B6 -> $B7
+      B$6 -> B$7
+      $B$6 -> $B$7
+    Only changes row numbers equal to src_row.
     """
+    def repl(m):
+        col = m.group(1)
+        dollar_row = m.group(2)
+        row_num = int(m.group(3))
+        if row_num == src_row:
+            return f"{col}{dollar_row}{dst_row}"
+        return m.group(0)
+
+    return _CELL_REF_RE.sub(repl, formula)
+
+
+def _copy_formulas_only_with_row_fix(ws, src_row: int, dst_row: int, min_col: int, max_col: int) -> None:
     for c in range(min_col, max_col + 1):
         src_val = ws.cell(row=src_row, column=c).value
         if isinstance(src_val, str) and src_val.startswith("="):
-            ws.cell(row=dst_row, column=c).value = src_val
+            ws.cell(row=dst_row, column=c).value = _rewrite_formula_row_refs(src_val, src_row, dst_row)
 
 
 def calc_nn_per_diem_for_day(d: date, departure_date: date, return_date: date) -> float:
@@ -337,6 +354,14 @@ def calc_nn_per_diem_total(departure_date: date, return_date: date) -> float:
     for d in _each_date_inclusive(departure_date, return_date):
         total += calc_nn_per_diem_for_day(d, departure_date, return_date)
     return total
+
+
+def _clamp_expense_date_to_trip(expense_d: date, departure_date: date, return_date: date) -> date:
+    if expense_d < departure_date:
+        return departure_date
+    if expense_d > return_date:
+        return return_date
+    return expense_d
 
 
 def generate_nn_excel_bytes(
@@ -368,34 +393,26 @@ def generate_nn_excel_bytes(
 
     ws = wb[resolved_sheet]
 
-    # Employee name in A1
     ws["A1"].value = employee_name
 
     template_last_row = _find_template_last_row(ws)
 
-    # Build date -> row mapping
     date_to_row: Dict[date, int] = {}
     r = NN_START_ROW
 
     for d in _each_date_inclusive(departure_date, return_date):
-        # For rows beyond template, copy ONLY formulas from last template row
         if r > template_last_row:
-            _copy_formulas_only(ws, template_last_row, r, 1, NN_COL_NOTES)
+            _copy_formulas_only_with_row_fix(ws, template_last_row, r, 1, NN_COL_NOTES)
 
-        # Date
         ws.cell(row=r, column=NN_COL_DATE).value = d
-
-        # Incidentals per diem only
         ws.cell(row=r, column=NN_COL_INCIDENTALS).value = calc_nn_per_diem_for_day(d, departure_date, return_date)
 
-        # All spend columns default to 0 unless employee enters an expense
         _set_zero(ws, r, NN_COL_AIRFARE)
         _set_zero(ws, r, NN_COL_LODGING)
         _set_zero(ws, r, NN_COL_VEHICLE_MILEAGE)
         _set_zero(ws, r, NN_COL_RENTAL_CAR)
         _set_zero(ws, r, NN_COL_MISC_TRAVEL)
 
-        # Notes default blank
         ws.cell(row=r, column=NN_COL_NOTES).value = ""
 
         date_to_row[d] = r
@@ -420,10 +437,11 @@ def generate_nn_excel_bytes(
         d = e.get("expense_date")
         if not isinstance(d, date):
             continue
-        if d < departure_date or d > return_date:
-            continue
 
-        row = date_to_row.get(d)
+        # NN behavior: clamp expenses outside the trip window onto the nearest trip day
+        d2 = _clamp_expense_date_to_trip(d, departure_date, return_date)
+
+        row = date_to_row.get(d2)
         if row is None:
             continue
 
@@ -446,7 +464,6 @@ def generate_nn_excel_bytes(
         else:
             employee_paid_total += amt
 
-        # Notes
         if desc and paid_by:
             note = f"{cat}: {desc} (Paid by {paid_by})"
         elif desc:
@@ -455,6 +472,11 @@ def generate_nn_excel_bytes(
             note = f"{cat} (Paid by {paid_by})"
         else:
             note = f"{cat}"
+
+        # If clamped, show original date in note
+        if d2 != d:
+            note = f"{note} (Original date {d})"
+
         _append_note(ws, row, note)
 
     nn_per_diem_total = calc_nn_per_diem_total(departure_date, return_date)
@@ -595,7 +617,7 @@ s1, s2, s3, s4 = st.columns(4)
 s1.metric("Total Spend", f"${total_spend:,.2f}")
 s2.metric("Company Paid", f"${company_paid:,.2f}")
 s3.metric("Employee Paid", f"${employee_paid:,.2f}")
-s4.metric("Reimbursement Due", f"${reimbursement_due:,.2f}")
+s4.metric("Employee Due", f"${reimbursement_due:,.2f}")
 
 st.subheader("Current Line Items")
 if not st.session_state.expenses:
@@ -654,7 +676,7 @@ if submit:
         st.error("Please complete the following fields: " + ", ".join(missing))
         st.stop()
 
-    # Trip info used by Guam generator, unchanged behavior
+    # Guam generator inputs, unchanged
     trip_info = {
         "employee_name": employee_name,
         "employee_email": employee_email,
@@ -674,7 +696,6 @@ if submit:
     attachments: List[Dict[str, Any]] = []
 
     if report_type == "Guam":
-        # Guam flow unchanged
         excel_bytes = generate_excel(trip_info, st.session_state.expenses)
         attachments.append(
             {
@@ -684,7 +705,6 @@ if submit:
             }
         )
     else:
-        # NN flow uses template and selected sheet
         try:
             nn_bytes = generate_nn_excel_bytes(
                 employee_name=employee_name,
@@ -705,7 +725,6 @@ if submit:
             }
         )
 
-    # Receipts unchanged
     for i, e in enumerate(st.session_state.expenses, start=1):
         f = e.get("receipt_file")
         if f is None:
@@ -723,7 +742,6 @@ if submit:
         filename = f"{i:02d}_{safe_cat}_{employee_name.replace(' ', '_')}.{ext if ext else 'pdf'}"
         attachments.append({"filename": filename, "content_bytes": b, "mime_type": mime})
 
-    # Enforce max total size
     total_bytes = sum(len(a["content_bytes"]) for a in attachments)
     max_bytes = int(MAX_ATTACHMENT_MB * 1024 * 1024)
     if total_bytes > max_bytes:
@@ -733,15 +751,9 @@ if submit:
         )
         st.stop()
 
-    subject = (
-        f"Expense Report Submitted, {employee_name}, {location}, "
-        f"{departure_date} to {return_date}"
-    )
+    subject = f"Expense Report Submitted, {employee_name}, {location}, {departure_date} to {return_date}"
     if report_type == "NN (Navajo Nation)":
-        subject = (
-            f"NN Expense Report Submitted, {employee_name}, {location}, "
-            f"{departure_date} to {return_date}"
-        )
+        subject = f"NN Expense Report Submitted, {employee_name}, {location}, {departure_date} to {return_date}"
 
     html_body = build_email_html(
         employee_name=employee_name,
