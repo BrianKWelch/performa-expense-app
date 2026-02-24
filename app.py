@@ -19,7 +19,6 @@ from sendgrid.helpers.mail import (
 )
 
 from openpyxl import load_workbook
-from openpyxl.cell.cell import Cell
 
 from excel_generator import generate_excel
 
@@ -253,48 +252,6 @@ def _safe_float(val) -> float:
         return 0.0
 
 
-def _copy_cell_style_and_formula(src: Cell, dst: Cell) -> None:
-    # Copy style
-    dst._style = src._style
-    dst.number_format = src.number_format
-    dst.font = src.font
-    dst.fill = src.fill
-    dst.border = src.border
-    dst.alignment = src.alignment
-    dst.protection = src.protection
-
-    # Copy formula or value as-is
-    if isinstance(src.value, str) and src.value.startswith("="):
-        dst.value = src.value
-    else:
-        dst.value = src.value
-
-
-def _copy_row(ws, src_row: int, dst_row: int, min_col: int, max_col: int) -> None:
-    for c in range(min_col, max_col + 1):
-        src = ws.cell(row=src_row, column=c)
-        dst = ws.cell(row=dst_row, column=c)
-        _copy_cell_style_and_formula(src, dst)
-
-
-def _find_last_prefilled_row(ws) -> int:
-    """
-    Finds the last row in the template daily grid that already has a table row style.
-    We scan downward from NN_START_ROW until we hit a completely empty DATE cell.
-    We return the last row that is part of the existing template band.
-    """
-    r = NN_START_ROW
-    last = NN_START_ROW
-    # Scan a reasonable window
-    for _ in range(0, 60):
-        v = ws.cell(row=r, column=NN_COL_DATE).value
-        if v is None or str(v).strip() == "":
-            break
-        last = r
-        r += 1
-    return last
-
-
 def _set_zero(ws, row: int, col: int) -> None:
     ws.cell(row=row, column=col).value = 0.0
 
@@ -338,6 +295,33 @@ def _write_killol_notes_values(ws, values: Dict[str, float]) -> None:
         if c <= 1:
             continue
         ws.cell(row=r, column=c - 1).value = float(amount)
+
+
+def _find_template_last_row(ws) -> int:
+    """
+    Finds the last prebuilt daily row in the template.
+    We scan downward from NN_START_ROW until the DATE cell is empty.
+    """
+    r = NN_START_ROW
+    last = NN_START_ROW
+    for _ in range(0, 60):
+        v = ws.cell(row=r, column=NN_COL_DATE).value
+        if v is None or str(v).strip() == "":
+            break
+        last = r
+        r += 1
+    return last
+
+
+def _copy_formulas_only(ws, src_row: int, dst_row: int, min_col: int, max_col: int) -> None:
+    """
+    Copies only formulas (cell values that start with '=') from src_row into dst_row.
+    No styles, no formatting, no StyleProxy issues.
+    """
+    for c in range(min_col, max_col + 1):
+        src_val = ws.cell(row=src_row, column=c).value
+        if isinstance(src_val, str) and src_val.startswith("="):
+            ws.cell(row=dst_row, column=c).value = src_val
 
 
 def calc_nn_per_diem_for_day(d: date, departure_date: date, return_date: date) -> float:
@@ -387,39 +371,36 @@ def generate_nn_excel_bytes(
     # Employee name in A1
     ws["A1"].value = employee_name
 
-    # Identify the last template row with formulas/formatting
-    template_last_row = _find_last_prefilled_row(ws)
+    template_last_row = _find_template_last_row(ws)
 
-    # Build date -> row mapping and ensure formulas exist for all rows we will use
+    # Build date -> row mapping
     date_to_row: Dict[date, int] = {}
     r = NN_START_ROW
 
     for d in _each_date_inclusive(departure_date, return_date):
-        # If this row is beyond the prebuilt template band, copy the last template row into it
+        # For rows beyond template, copy ONLY formulas from last template row
         if r > template_last_row:
-            # Copy A through M formatting and formulas, so K and L formulas exist
-            _copy_row(ws, template_last_row, r, 1, NN_COL_NOTES)
+            _copy_formulas_only(ws, template_last_row, r, 1, NN_COL_NOTES)
 
-        # Set date
+        # Date
         ws.cell(row=r, column=NN_COL_DATE).value = d
 
-        # Per diem goes only in Incidentals
+        # Incidentals per diem only
         ws.cell(row=r, column=NN_COL_INCIDENTALS).value = calc_nn_per_diem_for_day(d, departure_date, return_date)
 
-        # All spend columns start at 0 unless employee enters an expense
+        # All spend columns default to 0 unless employee enters an expense
         _set_zero(ws, r, NN_COL_AIRFARE)
         _set_zero(ws, r, NN_COL_LODGING)
         _set_zero(ws, r, NN_COL_VEHICLE_MILEAGE)
         _set_zero(ws, r, NN_COL_RENTAL_CAR)
         _set_zero(ws, r, NN_COL_MISC_TRAVEL)
 
-        # Notes blank by default
+        # Notes default blank
         ws.cell(row=r, column=NN_COL_NOTES).value = ""
 
         date_to_row[d] = r
         r += 1
 
-    # Map Streamlit categories to NN columns
     category_to_col = {
         "Airfare": NN_COL_AIRFARE,
         "Hotel": NN_COL_LODGING,
@@ -430,7 +411,6 @@ def generate_nn_excel_bytes(
         "Other": NN_COL_MISC_TRAVEL,
     }
 
-    # Track for Killol notes
     company_paid_hotel = 0.0
     company_paid_total = 0.0
     employee_paid_total = 0.0
@@ -477,16 +457,9 @@ def generate_nn_excel_bytes(
             note = f"{cat}"
         _append_note(ws, row, note)
 
-    # Per diem totals based on rules
     nn_per_diem_total = calc_nn_per_diem_total(departure_date, return_date)
-
-    # Total expense report: per diem plus all entered expenses
     total_expense_report = nn_per_diem_total + company_paid_total + employee_paid_total
-
-    # Amount due to employee: per diem plus any out of pocket
     amount_due_to_employee = nn_per_diem_total + employee_paid_total
-
-    # Amount due to Performa: company paid total
     amount_due_to_performa = company_paid_total
 
     killol_values = {
@@ -750,6 +723,7 @@ if submit:
         filename = f"{i:02d}_{safe_cat}_{employee_name.replace(' ', '_')}.{ext if ext else 'pdf'}"
         attachments.append({"filename": filename, "content_bytes": b, "mime_type": mime})
 
+    # Enforce max total size
     total_bytes = sum(len(a["content_bytes"]) for a in attachments)
     max_bytes = int(MAX_ATTACHMENT_MB * 1024 * 1024)
     if total_bytes > max_bytes:
