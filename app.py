@@ -25,13 +25,12 @@ from excel_generator import generate_excel
 from per_diem import calculate_per_diem_total, format_per_diem_summary
 from sendgrid_secrets import (
     format_sendgrid_error,
+    format_secrets_toml_lines,
     has_sendgrid_key,
-    make_sendgrid_b64,
     secret_float,
     secret_get,
     sendgrid_api_key,
     sendgrid_key_diagnostics,
-    verify_sendgrid_key_with_api,
 )
 
 
@@ -540,21 +539,21 @@ if st.session_state.pop("submit_success", False):
 
 def _render_email_setup_help(*, widget_key: str) -> None:
     st.markdown(
-        "Paste the encoded line into **[Streamlit Cloud](https://share.streamlit.io) → your app → "
-        "Settings → Secrets**, save, then **Reboot**."
+        "If email fails with **401**, your stored key is dead — create a new one in "
+        "[SendGrid](https://app.sendgrid.com/settings/api_keys) (Mail Send), paste it below, "
+        "then copy the lines into `.streamlit/secrets.toml` or Cloud Secrets and reboot."
     )
-    raw_key_for_b64 = st.text_input(
-        "Paste SendGrid API key to encode",
+    raw_key = st.text_input(
+        "Paste new SendGrid API key (one time, when rotating)",
         type="password",
         placeholder="SG.xxxxxxxxxxxx",
         key=widget_key,
     )
-    if raw_key_for_b64.strip():
+    if raw_key.strip():
         try:
-            b64_value = make_sendgrid_b64(raw_key_for_b64)
-            st.code(f'SENDGRID_API_KEY_B64 = "{b64_value}"', language="toml")
+            st.code(format_secrets_toml_lines(raw_key), language="toml")
         except Exception as ex:
-            st.error(f"Could not encode key: {ex}")
+            st.error(f"Could not format key: {ex}")
 
     diag = sendgrid_key_diagnostics()
     st.json(diag)
@@ -862,11 +861,6 @@ if submit:
             "Email is not configured. Add these keys to `.streamlit/secrets.toml` "
             f"(see `.streamlit/secrets.toml.example`): {', '.join(unset_secrets)}"
         )
-        st.stop()
-
-    key_error = verify_sendgrid_key_with_api()
-    if key_error:
-        st.error(key_error)
         st.stop()
 
     # Guam generator inputs, unchanged

@@ -210,11 +210,11 @@ def format_sendgrid_error(ex: Exception) -> str:
             "(PART1 must start with SG.). Remove any broken SENDGRID_API_KEY_B64 line."
         )
     if "401" in msg or "Unauthorized" in msg:
-        diag = sendgrid_key_diagnostics()
         return (
-            "SendGrid rejected the API key (401). "
-            f"Source: {diag.get('source', '?')}, length: {diag.get('length', '?')}. "
-            "Check PART1 starts with SG., or create a new SendGrid Mail Send key."
+            "SendGrid rejected the API key (401) — it is invalid or was revoked. "
+            "Create a new key at https://app.sendgrid.com/settings/api_keys "
+            "(Restricted → Mail Send), paste it in sidebar SendGrid setup, "
+            "copy the two lines into secrets.toml or Cloud Secrets, save, and reboot."
         )
     if "403" in msg or "Forbidden" in msg:
         return (
@@ -227,3 +227,21 @@ def format_sendgrid_error(ex: Exception) -> str:
 def make_sendgrid_b64(api_key: str) -> str:
     """Helper for local setup: base64-encode a SendGrid key for secrets."""
     return base64.b64encode(api_key.strip().encode("utf-8")).decode("ascii")
+
+
+def split_sendgrid_key_for_secrets(raw: str) -> tuple[str, str]:
+    """Split a full SG.… key into PART1 + PART2 for secrets.toml (first line ~25 chars)."""
+    key = normalize_sendgrid_key(raw)
+    if not key.startswith("SG."):
+        raise ValueError("SendGrid API key must start with SG.")
+    if len(key) < 50:
+        raise ValueError(f"Key too short ({len(key)} chars). Copy the full key from SendGrid.")
+    return key[:25], key[25:]
+
+
+def format_secrets_toml_lines(raw_key: str) -> str:
+    part1, part2 = split_sendgrid_key_for_secrets(raw_key)
+    return (
+        f'SENDGRID_API_KEY_PART1 = "{part1}"\n'
+        f'SENDGRID_API_KEY_PART2 = "{part2}"'
+    )
