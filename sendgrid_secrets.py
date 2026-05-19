@@ -79,27 +79,42 @@ def _part_length_diagnostics() -> List[Dict[str, Any]]:
     ]
 
 
-def raw_sendgrid_key_material() -> tuple[str, str]:
-    b64 = secret_get("SENDGRID_API_KEY_B64")
-    if b64.strip():
-        try:
-            decoded = base64.b64decode(b64.strip(), validate=True).decode("utf-8")
-            return decoded, "SENDGRID_API_KEY_B64"
-        except Exception as ex:
-            raise ValueError(f"SENDGRID_API_KEY_B64 is not valid base64: {ex}") from ex
-
+def _try_sendgrid_parts() -> Optional[tuple[str, str]]:
     parts = _collect_sendgrid_parts()
-    if parts:
-        label = f"PART×{len(parts)}" if len(parts) > 1 else "PART1"
-        return "".join(parts), label
+    if not parts:
+        return None
+    label = f"PART×{len(parts)}" if len(parts) > 1 else "PART1"
+    return "".join(parts), label
 
+
+def _try_sendgrid_single() -> Optional[tuple[str, str]]:
     single = secret_get("SENDGRID_API_KEY")
     if single.strip():
         return single, "SENDGRID_API_KEY"
+    return None
+
+
+def _try_sendgrid_b64() -> Optional[tuple[str, str]]:
+    b64 = secret_get("SENDGRID_API_KEY_B64")
+    if not b64.strip():
+        return None
+    try:
+        decoded = base64.b64decode(b64.strip(), validate=True).decode("utf-8")
+        return decoded, "SENDGRID_API_KEY_B64"
+    except Exception:
+        # Ignore invalid B64 so PART1+PART2 or SENDGRID_API_KEY still work.
+        return None
+
+
+def raw_sendgrid_key_material() -> tuple[str, str]:
+    for loader in (_try_sendgrid_parts, _try_sendgrid_single, _try_sendgrid_b64):
+        result = loader()
+        if result:
+            return result
 
     raise KeyError(
-        "No SendGrid key in secrets. Easiest fix: add SENDGRID_API_KEY_B64 (one line). "
-        "See the app's Email setup help or secrets.toml.example."
+        "No SendGrid key in secrets. Add SENDGRID_API_KEY_PART1 + PART2 "
+        "(PART1 must start with SG.) or SENDGRID_API_KEY on one line."
     )
 
 
@@ -191,15 +206,15 @@ def format_sendgrid_error(ex: Exception) -> str:
         isinstance(ex, KeyError) and "SENDGRID_API_KEY" in str(ex)
     ):
         return (
-            "SendGrid key not loaded. Use SENDGRID_API_KEY_B64 in Cloud secrets (one line) — "
-            "see **Email setup help** on this page. Push latest code from GitHub, then Reboot."
+            "SendGrid key not loaded. Add SENDGRID_API_KEY_PART1 + PART2 in secrets "
+            "(PART1 must start with SG.). Remove any broken SENDGRID_API_KEY_B64 line."
         )
     if "401" in msg or "Unauthorized" in msg:
         diag = sendgrid_key_diagnostics()
         return (
             "SendGrid rejected the API key (401). "
             f"Source: {diag.get('source', '?')}, length: {diag.get('length', '?')}. "
-            "Try SENDGRID_API_KEY_B64 or a new SendGrid API key."
+            "Check PART1 starts with SG., or create a new SendGrid Mail Send key."
         )
     if "403" in msg or "Forbidden" in msg:
         return (
