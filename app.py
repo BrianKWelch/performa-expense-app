@@ -22,6 +22,17 @@ from sendgrid.helpers.mail import (
 from openpyxl import load_workbook
 
 from excel_generator import generate_excel
+from per_diem import calculate_per_diem_total, format_per_diem_summary
+from sendgrid_secrets import (
+    format_sendgrid_error,
+    has_sendgrid_key,
+    make_sendgrid_b64,
+    secret_float,
+    secret_get,
+    sendgrid_api_key,
+    sendgrid_key_diagnostics,
+    verify_sendgrid_key_with_api,
+)
 
 
 # -----------------------------
@@ -29,14 +40,17 @@ from excel_generator import generate_excel
 # -----------------------------
 st.set_page_config(page_title="Performa Expense Report", layout="wide")
 
-# Guam per diem rate, unchanged
-PER_DIEM_RATE = float(st.secrets.get("PER_DIEM_RATE", 100))
+# Guam per diem: $75 first/last day, $100 middle days (overridable via secrets)
+PER_DIEM_MIDDLE_RATE = secret_float(
+    "PER_DIEM_MIDDLE_RATE", secret_float("PER_DIEM_RATE", 100.0)
+)
+PER_DIEM_FIRST_LAST_RATE = secret_float("PER_DIEM_FIRST_LAST_RATE", 75.0)
 
 # NN per diem rates
-NN_TRAVEL_DAY_RATE = float(st.secrets.get("NN_TRAVEL_DAY_RATE", 51))
-NN_NON_TRAVEL_DAY_RATE = float(st.secrets.get("NN_NON_TRAVEL_DAY_RATE", 68))
+NN_TRAVEL_DAY_RATE = secret_float("NN_TRAVEL_DAY_RATE", 51.0)
+NN_NON_TRAVEL_DAY_RATE = secret_float("NN_NON_TRAVEL_DAY_RATE", 68.0)
 
-MAX_ATTACHMENT_MB = float(st.secrets.get("MAX_ATTACHMENT_MB", 18))
+MAX_ATTACHMENT_MB = secret_float("MAX_ATTACHMENT_MB", 18.0)
 
 TEMPLATES_DIR = "templates"
 NN_TEMPLATE_FILENAME = "nn_templates.xlsx"
@@ -72,6 +86,16 @@ CATEGORIES = [
 # -----------------------------
 # Helpers
 # -----------------------------
+def missing_email_secrets() -> List[str]:
+    missing = []
+    if not has_sendgrid_key():
+        missing.append("SENDGRID_API_KEY_PART1 + PART2 (one line each; use PART3/PART4 if needed)")
+    for key in ("SENDER_EMAIL", "FINANCE_EMAIL", "APPROVER_EMAIL"):
+        if not secret_get(key).strip():
+            missing.append(key)
+    return missing
+
+
 def bytes_from_uploaded_file(uploaded_file) -> bytes:
     if uploaded_file is None:
         return b""
@@ -206,16 +230,16 @@ def send_email_with_attachments(
     employee_email: str,
     attachments: List[Dict[str, Any]],
 ) -> int:
-    sg = SendGridAPIClient(st.secrets["SENDGRID_API_KEY"])
+    sg = SendGridAPIClient(sendgrid_api_key())
 
     msg = Mail(
-        from_email=Email(st.secrets["SENDER_EMAIL"]),
-        to_emails=To(st.secrets["FINANCE_EMAIL"]),
+        from_email=Email(secret_get("SENDER_EMAIL")),
+        to_emails=To(secret_get("FINANCE_EMAIL")),
         subject=subject,
         html_content=html_body,
     )
 
-    msg.add_cc(Cc(st.secrets["APPROVER_EMAIL"]))
+    msg.add_cc(Cc(secret_get("APPROVER_EMAIL")))
     msg.add_cc(Cc(employee_email))
 
     for a in attachments:
@@ -505,12 +529,58 @@ def generate_nn_excel_bytes(
 if "expenses" not in st.session_state:
     st.session_state.expenses = []
 
+if "editing_expense_idx" not in st.session_state:
+    st.session_state.editing_expense_idx = None
+
+if st.session_state.pop("submit_success", False):
+    st.success("Submitted successfully. Check your email for the package.")
+
+
+def _render_email_setup_help(*, widget_key: str) -> None:
+    st.markdown(
+        "Paste the encoded line into **[Streamlit Cloud](https://share.streamlit.io) → your app → "
+        "Settings → Secrets**, save, then **Reboot**."
+    )
+    raw_key_for_b64 = st.text_input(
+        "Paste SendGrid API key to encode",
+        type="password",
+        placeholder="SG.xxxxxxxxxxxx",
+        key=widget_key,
+    )
+    if raw_key_for_b64.strip():
+        try:
+            b64_value = make_sendgrid_b64(raw_key_for_b64)
+            st.code(f'SENDGRID_API_KEY_B64 = "{b64_value}"', language="toml")
+        except Exception as ex:
+            st.error(f"Could not encode key: {ex}")
+
+    diag = sendgrid_key_diagnostics()
+    st.json(diag)
+    if not diag.get("ok"):
+        st.warning("Key not valid yet — use SENDGRID_API_KEY_B64 (one line in Secrets).")
+
+
+with st.sidebar:
+    st.subheader("SendGrid setup")
+    _render_email_setup_help(widget_key="sendgrid_key_encode_sidebar")
+
 
 # -----------------------------
 # UI
 # -----------------------------
+st.markdown(
+    '<p style="font-size:1.75rem;font-weight:700;letter-spacing:0.06em;margin:0 0 0.15rem 0;">PERFORMA</p>',
+    unsafe_allow_html=True,
+)
 st.title("Performa Expense Report")
-st.caption("Guam mode generates Excel plus receipts. NN mode populates the NN Excel template plus receipts. Emails Finance, Approver, and Employee.")
+st.caption("© 2026 bkw")
+st.caption(
+    "Guam mode generates Excel plus receipts. NN mode populates the NN Excel template plus receipts. "
+    "Emails Finance, Approver, and Employee."
+)
+
+with st.expander("Email setup help (same as sidebar → SendGrid setup)", expanded=not has_sendgrid_key()):
+    _render_email_setup_help(widget_key="sendgrid_key_encode_main")
 
 st.subheader("Report Type")
 report_type = st.radio(
@@ -560,8 +630,18 @@ with col4:
 trip_days = calc_trip_days(departure_date, return_date)
 
 if report_type == "Guam":
-    per_diem_total_display = PER_DIEM_RATE * trip_days
-    st.info(f"Per diem is ${PER_DIEM_RATE:,.0f} per day, {trip_days} day(s), total ${per_diem_total_display:,.2f}")
+    per_diem_total_display = calculate_per_diem_total(
+        trip_days,
+        first_last_rate=PER_DIEM_FIRST_LAST_RATE,
+        middle_rate=PER_DIEM_MIDDLE_RATE,
+    )
+    st.info(
+        format_per_diem_summary(
+            trip_days,
+            first_last_rate=PER_DIEM_FIRST_LAST_RATE,
+            middle_rate=PER_DIEM_MIDDLE_RATE,
+        )
+    )
 else:
     per_diem_total_display = calc_nn_per_diem_total(departure_date, return_date)
     st.info(
@@ -572,36 +652,39 @@ else:
 st.subheader("Expenses")
 
 with st.expander("Add an expense", expanded=True):
-    c1, c2, c3 = st.columns([2, 2, 2])
-    with c1:
-        category = st.selectbox("Category", CATEGORIES)
-    with c2:
-        expense_date = st.date_input("Expense Date", value=date.today())
-    with c3:
-        paid_by = st.radio("Paid By", ["Employee", "Performa"], horizontal=True)
+    with st.form("add_expense_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([2, 2, 2])
+        with c1:
+            category = st.selectbox("Category", CATEGORIES)
+        with c2:
+            expense_date = st.date_input("Expense Date", value=departure_date)
+        with c3:
+            paid_by = st.radio("Paid By", ["Employee", "Performa"], horizontal=True)
 
-    description = st.text_input("Description (optional)")
-    amount = st.number_input("Amount", min_value=0.0, value=0.0, step=1.0, format="%.2f")
+        description = st.text_input("Description (optional)")
+        amount = st.number_input("Amount", min_value=0.0, value=0.0, step=1.0, format="%.2f")
 
-    receipt_file = st.file_uploader(
-        "Receipt (optional)",
-        type=["pdf", "png", "jpg", "jpeg"],
-        accept_multiple_files=False,
-        help="Accepted: PDF, JPG, JPEG, PNG",
-    )
-
-    if st.button("Add Expense"):
-        st.session_state.expenses.append(
-            {
-                "category": category,
-                "expense_date": expense_date,
-                "paid_by": paid_by,
-                "description": description,
-                "amount": float(amount),
-                "receipt_file": receipt_file,
-            }
+        receipt_file = st.file_uploader(
+            "Receipt (optional)",
+            type=["pdf", "png", "jpg", "jpeg"],
+            accept_multiple_files=False,
+            help="Accepted: PDF, JPG, JPEG, PNG",
         )
-        st.success("Expense added.")
+
+        add_btn = st.form_submit_button("Add Expense")
+
+        if add_btn:
+            st.session_state.expenses.append(
+                {
+                    "category": category,
+                    "expense_date": expense_date,
+                    "paid_by": paid_by,
+                    "description": description,
+                    "amount": float(amount),
+                    "receipt_file": receipt_file,
+                }
+            )
+            st.success("Expense added.")
 
 
 st.subheader("Summary")
@@ -619,31 +702,122 @@ s2.metric("Company Paid", f"${company_paid:,.2f}")
 s3.metric("Employee Paid", f"${employee_paid:,.2f}")
 s4.metric("Employee Due", f"${reimbursement_due:,.2f}")
 
+def _expense_line_label(idx: int, e: Dict[str, Any]) -> str:
+    receipt_note = "receipt" if e.get("receipt_file") else "no receipt"
+    desc = (e.get("description") or "").strip() or "—"
+    return (
+        f"{idx + 1}. {e['category']} on {e['expense_date']}, {desc}, "
+        f"${float(e['amount']):,.2f}, {e['paid_by']}, {receipt_note}"
+    )
+
+
 st.subheader("Current Line Items")
 if not st.session_state.expenses:
     st.write("No expenses added yet.")
+    st.session_state.editing_expense_idx = None
 else:
-    for idx, e in enumerate(st.session_state.expenses, start=1):
-        receipt_note = "Receipt attached" if e.get("receipt_file") else "No receipt"
-        st.write(
-            f"{idx}. {e['category']} on {e['expense_date']}, {e['description'] or '$0'}, "
-            f"${float(e['amount']):,.2f}, Paid by {e['paid_by']}, {receipt_note}"
-        )
+    for idx, e in enumerate(st.session_state.expenses):
+        st.write(_expense_line_label(idx, e))
 
-    remove_idx = st.number_input(
-        "Remove line item number",
-        min_value=0,
-        max_value=len(st.session_state.expenses),
-        value=0,
-        step=1,
-        help="Enter the line number to remove, 0 means do nothing.",
+    line_options = list(range(len(st.session_state.expenses)))
+    selected_line = st.selectbox(
+        "Select line item to edit or remove",
+        options=line_options,
+        format_func=lambda i: _expense_line_label(i, st.session_state.expenses[i]),
+        key="selected_expense_line",
     )
-    if st.button("Remove Selected Line Item"):
-        if remove_idx == 0:
-            st.info("No line item selected.")
-        else:
-            st.session_state.expenses.pop(int(remove_idx) - 1)
-            st.success("Removed.")
+
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        if st.button("Edit Selected", use_container_width=True):
+            st.session_state.editing_expense_idx = selected_line
+            st.rerun()
+    with action_col2:
+        if st.button("Remove Selected", use_container_width=True):
+            st.session_state.expenses.pop(selected_line)
+            if st.session_state.editing_expense_idx == selected_line:
+                st.session_state.editing_expense_idx = None
+            elif (
+                st.session_state.editing_expense_idx is not None
+                and st.session_state.editing_expense_idx > selected_line
+            ):
+                st.session_state.editing_expense_idx -= 1
+            st.rerun()
+
+    edit_idx = st.session_state.editing_expense_idx
+    if edit_idx is not None and edit_idx < len(st.session_state.expenses):
+        expense = st.session_state.expenses[edit_idx]
+        with st.expander(f"Edit line item {edit_idx + 1}", expanded=True):
+            with st.form("edit_expense_form"):
+                ec1, ec2, ec3 = st.columns([2, 2, 2])
+                with ec1:
+                    cat_index = (
+                        CATEGORIES.index(expense["category"])
+                        if expense["category"] in CATEGORIES
+                        else 0
+                    )
+                    edit_category = st.selectbox(
+                        "Category",
+                        CATEGORIES,
+                        index=cat_index,
+                    )
+                with ec2:
+                    edit_date = st.date_input(
+                        "Expense Date",
+                        value=expense["expense_date"],
+                    )
+                with ec3:
+                    edit_paid_by = st.radio(
+                        "Paid By",
+                        ["Employee", "Performa"],
+                        index=0 if expense["paid_by"] == "Employee" else 1,
+                        horizontal=True,
+                    )
+
+                edit_description = st.text_input(
+                    "Description (optional)",
+                    value=expense.get("description") or "",
+                )
+                edit_amount = st.number_input(
+                    "Amount",
+                    min_value=0.0,
+                    value=float(expense.get("amount", 0)),
+                    step=1.0,
+                    format="%.2f",
+                )
+
+                if expense.get("receipt_file"):
+                    st.caption(f"Current receipt: {expense['receipt_file'].name}")
+                edit_receipt = st.file_uploader(
+                    "Receipt (optional, upload to replace)",
+                    type=["pdf", "png", "jpg", "jpeg"],
+                    accept_multiple_files=False,
+                    help="Leave empty to keep the existing receipt.",
+                )
+
+                save_col, cancel_col = st.columns(2)
+                with save_col:
+                    save_edit = st.form_submit_button("Save Changes", use_container_width=True)
+                with cancel_col:
+                    cancel_edit = st.form_submit_button("Cancel", use_container_width=True)
+
+                if save_edit:
+                    st.session_state.expenses[edit_idx] = {
+                        "category": edit_category,
+                        "expense_date": edit_date,
+                        "paid_by": edit_paid_by,
+                        "description": edit_description,
+                        "amount": float(edit_amount),
+                        "receipt_file": edit_receipt or expense.get("receipt_file"),
+                    }
+                    st.session_state.editing_expense_idx = None
+                    st.rerun()
+
+                if cancel_edit:
+                    st.session_state.editing_expense_idx = None
+                    st.rerun()
+    elif edit_idx is not None:
+        st.session_state.editing_expense_idx = None
 
 
 st.divider()
@@ -676,6 +850,19 @@ if submit:
         st.error("Please complete the following fields: " + ", ".join(missing))
         st.stop()
 
+    unset_secrets = missing_email_secrets()
+    if unset_secrets:
+        st.error(
+            "Email is not configured. Add these keys to `.streamlit/secrets.toml` "
+            f"(see `.streamlit/secrets.toml.example`): {', '.join(unset_secrets)}"
+        )
+        st.stop()
+
+    key_error = verify_sendgrid_key_with_api()
+    if key_error:
+        st.error(key_error)
+        st.stop()
+
     # Guam generator inputs, unchanged
     trip_info = {
         "employee_name": employee_name,
@@ -685,12 +872,13 @@ if submit:
         "departure_date": departure_date,
         "return_date": return_date,
         "trip_days": trip_days,
-        "per_diem_rate": PER_DIEM_RATE,
-        "per_diem_total": (PER_DIEM_RATE * trip_days),
+        "per_diem_first_last_rate": PER_DIEM_FIRST_LAST_RATE,
+        "per_diem_middle_rate": PER_DIEM_MIDDLE_RATE,
+        "per_diem_total": per_diem_total_display,
         "total_spend": total_spend,
         "company_paid": company_paid,
         "employee_paid": employee_paid,
-        "reimbursement_due": (PER_DIEM_RATE * trip_days) + employee_paid,
+        "reimbursement_due": per_diem_total_display + employee_paid,
     }
 
     attachments: List[Dict[str, Any]] = []
@@ -779,8 +967,11 @@ if submit:
         )
 
         if 200 <= int(status_code) < 300:
-            st.success("Submitted successfully. Check your email for the package.")
+            st.session_state.expenses = []
+            st.session_state.editing_expense_idx = None
+            st.session_state.submit_success = True
+            st.rerun()
         else:
             st.error(f"SendGrid returned status code: {status_code}")
     except Exception as ex:
-        st.error(f"Email failed: {ex}")
+        st.error(format_sendgrid_error(ex))

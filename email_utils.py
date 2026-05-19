@@ -27,7 +27,9 @@ def send_email(subject, body, attachment_bytes, attachment_filename, employee_em
 
         message.attachment = attachment
 
-        sg = SendGridAPIClient(st.secrets["SENDGRID_API_KEY"])
+        from sendgrid_secrets import sendgrid_api_key
+
+        sg = SendGridAPIClient(sendgrid_api_key())
         response = sg.send(message)
 
         return response.status_code

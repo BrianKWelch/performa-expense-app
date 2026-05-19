@@ -40,48 +40,60 @@ def generate_excel(trip_info: Dict[str, Any], expenses: List[Dict[str, Any]]) ->
     header_fill = PatternFill("solid", fgColor="EEEEEE")
     bold = Font(bold=True)
 
-    ws["A1"] = "Performa Expense Report"
+    ws["A1"] = "PERFORMA"
     ws["A1"].font = Font(bold=True, size=16)
     ws["A1"].alignment = Alignment(horizontal="left")
 
-    ws["A3"] = "Employee Name"
-    ws["B3"] = trip_info.get("employee_name", "")
-    ws["A4"] = "Employee Email"
-    ws["B4"] = trip_info.get("employee_email", "")
-    ws["A5"] = "Trip Location"
-    ws["B5"] = trip_info.get("location", "")
-    ws["A6"] = "Business Purpose"
-    ws["B6"] = trip_info.get("purpose", "")
-    ws["A7"] = "Departure Date"
-    ws["B7"] = trip_info.get("departure_date", "")
-    ws["A8"] = "Return Date"
-    ws["B8"] = trip_info.get("return_date", "")
-    ws["A9"] = "Trip Days"
-    ws["B9"] = trip_info.get("trip_days", 0)
+    ws["A2"] = "Performa Expense Report"
+    ws["A2"].font = Font(bold=True, size=12)
+    ws["A2"].alignment = Alignment(horizontal="left")
 
-    ws["A11"] = "Per Diem Rate"
-    ws["B11"] = float(trip_info.get("per_diem_rate", 0) or 0)
-    ws["A12"] = "Per Diem Total"
-    ws["B12"] = float(trip_info.get("per_diem_total", 0) or 0)
+    ws["A3"] = "© 2026 bkw"
+    ws["A3"].font = Font(size=9, italic=True, color="666666")
+    ws["A3"].alignment = Alignment(horizontal="left")
 
-    ws["A14"] = "Total Spend"
-    ws["B14"] = float(trip_info.get("total_spend", 0) or 0)
-    ws["A15"] = "Company Paid"
-    ws["B15"] = float(trip_info.get("company_paid", 0) or 0)
-    ws["A16"] = "Employee Paid"
-    ws["B16"] = float(trip_info.get("employee_paid", 0) or 0)
-    ws["A17"] = "Reimbursement Due"
-    ws["B17"] = float(trip_info.get("reimbursement_due", 0) or 0)
+    ws["A5"] = "Employee Name"
+    ws["B5"] = trip_info.get("employee_name", "")
+    ws["A6"] = "Employee Email"
+    ws["B6"] = trip_info.get("employee_email", "")
+    ws["A7"] = "Trip Location"
+    ws["B7"] = trip_info.get("location", "")
+    ws["A8"] = "Business Purpose"
+    ws["B8"] = trip_info.get("purpose", "")
+    ws["A9"] = "Departure Date"
+    ws["B9"] = trip_info.get("departure_date", "")
+    ws["A10"] = "Return Date"
+    ws["B10"] = trip_info.get("return_date", "")
+    ws["A11"] = "Trip Days"
+    ws["B11"] = trip_info.get("trip_days", 0)
 
-    for r in range(3, 18):
+    ws["A13"] = "Per Diem First/Last Day Rate"
+    ws["B13"] = float(trip_info.get("per_diem_first_last_rate", 0) or 0)
+    ws["A14"] = "Per Diem Middle Day Rate"
+    ws["B14"] = float(trip_info.get("per_diem_middle_rate", 0) or 0)
+    ws["A15"] = "Per Diem Days"
+    ws["B15"] = trip_info.get("trip_days", 0)
+    ws["A16"] = "Per Diem Total"
+    ws["B16"] = float(trip_info.get("per_diem_total", 0) or 0)
+
+    ws["A18"] = "Total Spend"
+    ws["B18"] = float(trip_info.get("total_spend", 0) or 0)
+    ws["A19"] = "Company Paid"
+    ws["B19"] = float(trip_info.get("company_paid", 0) or 0)
+    ws["A20"] = "Employee Paid"
+    ws["B20"] = float(trip_info.get("employee_paid", 0) or 0)
+    ws["A21"] = "Reimbursement Due"
+    ws["B21"] = float(trip_info.get("reimbursement_due", 0) or 0)
+
+    for r in range(5, 22):
         ws[f"A{r}"].font = bold
 
-    # Format currency fields
-    for cell in ["B11", "B12", "B14", "B15", "B16", "B17"]:
+    for cell in ["B13", "B14", "B16", "B18", "B19", "B20", "B21"]:
         ws[cell].number_format = '"$"#,##0.00'
+    ws["B15"].number_format = "0"
 
-    ws["B6"].alignment = Alignment(wrap_text=True)
-    ws.row_dimensions[6].height = 45
+    ws["B8"].alignment = Alignment(wrap_text=True)
+    ws.row_dimensions[8].height = 45
 
     _auto_width(ws)
 
