@@ -6,9 +6,12 @@ import base64
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
+
+LOCAL_SECRETS_PATH = Path(".streamlit") / "secrets.toml"
 
 def secret_get(key: str, default: str = "") -> str:
     try:
@@ -210,11 +213,14 @@ def format_sendgrid_error(ex: Exception) -> str:
             "(PART1 must start with SG.). Remove any broken SENDGRID_API_KEY_B64 line."
         )
     if "401" in msg or "Unauthorized" in msg:
+        hint = loaded_sendgrid_key_hint()
         return (
-            "SendGrid rejected the API key (401) — it is invalid or was revoked. "
-            "Create a new key at https://app.sendgrid.com/settings/api_keys "
-            "(Restricted → Mail Send), paste it in sidebar SendGrid setup, "
-            "copy the two lines into secrets.toml or Cloud Secrets, save, and reboot."
+            "SendGrid rejected the API key (401). "
+            f"Key currently loaded from secrets: {hint}. "
+            "If you created a new key, it must be saved in `.streamlit/secrets.toml` "
+            "(sidebar paste alone does not update secrets). "
+            "Use **Save to local secrets** in the sidebar, or paste "
+            "`SENDGRID_API_KEY = \"SG.…\"` on one line, then **stop and restart** Streamlit."
         )
     if "403" in msg or "Forbidden" in msg:
         return (
@@ -240,8 +246,58 @@ def split_sendgrid_key_for_secrets(raw: str) -> tuple[str, str]:
 
 
 def format_secrets_toml_lines(raw_key: str) -> str:
-    part1, part2 = split_sendgrid_key_for_secrets(raw_key)
-    return (
-        f'SENDGRID_API_KEY_PART1 = "{part1}"\n'
-        f'SENDGRID_API_KEY_PART2 = "{part2}"'
+    key = normalize_sendgrid_key(raw_key)
+    if not key.startswith("SG."):
+        raise ValueError("SendGrid API key must start with SG.")
+    if len(key) < 50:
+        raise ValueError(f"Key too short ({len(key)} chars). Copy the full key from SendGrid.")
+    return f'SENDGRID_API_KEY = "{key}"'
+
+
+def loaded_sendgrid_key_hint() -> str:
+    try:
+        key = sendgrid_api_key()
+        return f"{key[:12]}… (length {len(key)})"
+    except Exception as ex:
+        return f"not loaded ({ex})"
+
+
+def pasted_key_matches_loaded(pasted: str) -> bool:
+    try:
+        loaded = sendgrid_api_key()
+        pasted_norm = normalize_sendgrid_key(pasted)
+        return pasted_norm == loaded
+    except Exception:
+        return False
+
+
+def _strip_sendgrid_lines(text: str) -> str:
+    drop_prefixes = (
+        "SENDGRID_API_KEY",
+        "SENDGRID_API_KEY_PART",
+        "SENDGRID_API_KEY_B64",
     )
+    kept: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if any(stripped.startswith(p) for p in drop_prefixes):
+            continue
+        kept.append(line)
+    return "\n".join(kept).rstrip()
+
+
+def write_local_secrets_sendgrid_key(raw_key: str) -> None:
+    """Update .streamlit/secrets.toml with a single-line SENDGRID_API_KEY (local dev)."""
+    key = normalize_sendgrid_key(raw_key)
+    if not key.startswith("SG.") or len(key) < 50:
+        raise ValueError("Paste the full SendGrid API key from the dashboard.")
+
+    path = LOCAL_SECRETS_PATH
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    body = _strip_sendgrid_lines(existing)
+    block = f'SENDGRID_API_KEY = "{key}"'
+    new_text = f"{body}\n\n{block}\n" if body.strip() else f"{block}\n"
+    path.write_text(new_text, encoding="utf-8")

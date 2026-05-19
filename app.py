@@ -24,13 +24,17 @@ from openpyxl import load_workbook
 from excel_generator import generate_excel
 from per_diem import calculate_per_diem_total, format_per_diem_summary
 from sendgrid_secrets import (
+    LOCAL_SECRETS_PATH,
     format_sendgrid_error,
     format_secrets_toml_lines,
     has_sendgrid_key,
+    loaded_sendgrid_key_hint,
+    pasted_key_matches_loaded,
     secret_float,
     secret_get,
     sendgrid_api_key,
     sendgrid_key_diagnostics,
+    write_local_secrets_sendgrid_key,
 )
 
 
@@ -538,13 +542,13 @@ if st.session_state.pop("submit_success", False):
 
 
 def _render_email_setup_help(*, widget_key: str) -> None:
-    st.markdown(
-        "If email fails with **401**, your stored key is dead — create a new one in "
-        "[SendGrid](https://app.sendgrid.com/settings/api_keys) (Mail Send), paste it below, "
-        "then copy the lines into `.streamlit/secrets.toml` or Cloud Secrets and reboot."
+    st.caption(f"**Key in secrets now:** `{loaded_sendgrid_key_hint()}`")
+    st.warning(
+        "Pasting below does **not** change secrets by itself. You must save to "
+        "`.streamlit/secrets.toml` (or Cloud Secrets) and **restart Streamlit**."
     )
     raw_key = st.text_input(
-        "Paste new SendGrid API key (one time, when rotating)",
+        "Paste SendGrid API key from dashboard",
         type="password",
         placeholder="SG.xxxxxxxxxxxx",
         key=widget_key,
@@ -552,8 +556,29 @@ def _render_email_setup_help(*, widget_key: str) -> None:
     if raw_key.strip():
         try:
             st.code(format_secrets_toml_lines(raw_key), language="toml")
+            if not pasted_key_matches_loaded(raw_key):
+                st.error(
+                    "This pasted key is **not** what secrets are using yet. "
+                    "Save it (button below or edit the file), then restart Streamlit."
+                )
+            else:
+                st.success("Pasted key matches what is loaded from secrets.")
         except Exception as ex:
             st.error(f"Could not format key: {ex}")
+
+        if LOCAL_SECRETS_PATH.exists():
+            if st.button(
+                "Save to local secrets.toml",
+                key=f"{widget_key}_save_local",
+                use_container_width=True,
+            ):
+                try:
+                    write_local_secrets_sendgrid_key(raw_key)
+                    st.success(
+                        "Saved. **Stop Streamlit (Ctrl+C) and run again** so the new key loads."
+                    )
+                except Exception as ex:
+                    st.error(str(ex))
 
     diag = sendgrid_key_diagnostics()
     st.json(diag)
