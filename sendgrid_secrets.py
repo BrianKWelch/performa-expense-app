@@ -203,24 +203,46 @@ def verify_sendgrid_key_with_api() -> Optional[str]:
         return f"Could not reach SendGrid to validate the key: {ex}"
 
 
+def _sendgrid_response_detail(ex: Exception) -> str:
+    body = getattr(ex, "body", None)
+    if body is None:
+        return ""
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+    if "Maximum credits exceeded" in text:
+        return (
+            "SendGrid blocked sending: **Maximum credits exceeded**. "
+            "Your API key is valid, but this account has no email credits left. "
+            "Open [SendGrid Billing](https://app.sendgrid.com/settings/billing) to add a plan "
+            "or credits, or switch to an account with sending available."
+        )
+    if "does not match a verified Sender Identity" in text:
+        return (
+            "SendGrid blocked sending: the From address is not a verified sender. "
+            "Verify your sender email in SendGrid → Settings → Sender Authentication."
+        )
+    return ""
+
+
 def format_sendgrid_error(ex: Exception) -> str:
     msg = str(ex)
+    detail = _sendgrid_response_detail(ex)
+    if detail:
+        return detail
+
     if 'has no key "SENDGRID_API_KEY"' in msg or (
         isinstance(ex, KeyError) and "SENDGRID_API_KEY" in str(ex)
     ):
         return (
-            "SendGrid key not loaded. Add SENDGRID_API_KEY_PART1 + PART2 in secrets "
-            "(PART1 must start with SG.). Remove any broken SENDGRID_API_KEY_B64 line."
+            "SendGrid key not loaded. Add SENDGRID_API_KEY on one line in secrets "
+            "(see sidebar SendGrid setup)."
         )
     if "401" in msg or "Unauthorized" in msg:
         hint = loaded_sendgrid_key_hint()
         return (
-            "SendGrid rejected the API key (401). "
-            f"Key currently loaded from secrets: {hint}. "
-            "If you created a new key, it must be saved in `.streamlit/secrets.toml` "
-            "(sidebar paste alone does not update secrets). "
-            "Use **Save to local secrets** in the sidebar, or paste "
-            "`SENDGRID_API_KEY = \"SG.…\"` on one line, then **stop and restart** Streamlit."
+            "SendGrid returned 401 Unauthorized. "
+            f"Key loaded from secrets: {hint}. "
+            "If the key is new, save it in `.streamlit/secrets.toml` and restart Streamlit. "
+            "If the key is correct, check SendGrid billing and sender verification."
         )
     if "403" in msg or "Forbidden" in msg:
         return (
