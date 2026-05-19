@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
+# SendGrid v3 keys are typically SG.<22>.<43> → 69 characters after normalization.
+SENDGRID_KEY_TYPICAL_LENGTH = 69
+
 
 def secret_get(key: str, default: str = "") -> str:
     try:
@@ -58,6 +61,46 @@ def _collect_sendgrid_parts() -> List[str]:
     return [value for _num, value in part_nums if value.strip()]
 
 
+def _part_length_diagnostics() -> List[Dict[str, Any]]:
+    part_nums: List[tuple[int, str]] = []
+    try:
+        keys = list(st.secrets.keys())
+    except Exception:
+        keys = []
+    pattern = re.compile(r"^SENDGRID_API_KEY_PART(\d+)$")
+    for key in keys:
+        match = pattern.match(str(key))
+        if match:
+            part_nums.append((int(match.group(1)), secret_get(key)))
+    part_nums.sort(key=lambda x: x[0])
+    return [
+        {
+            "part": num,
+            "chars": len(normalize_sendgrid_key(value)),
+        }
+        for num, value in part_nums
+        if value.strip()
+    ]
+
+
+def sendgrid_key_length_issue(key: str) -> Optional[str]:
+    length = len(key)
+    if length < SENDGRID_KEY_TYPICAL_LENGTH:
+        return (
+            f"SendGrid API key looks truncated ({length} characters; expected "
+            f"{SENDGRID_KEY_TYPICAL_LENGTH}). A character was likely lost when splitting "
+            "into PART1–PART4 or when pasting into Secrets. Use SENDGRID_API_KEY_B64 "
+            "(one line) instead, or fix the parts so the joined key is exactly "
+            f"{SENDGRID_KEY_TYPICAL_LENGTH} characters."
+        )
+    if length > SENDGRID_KEY_TYPICAL_LENGTH:
+        return (
+            f"SendGrid API key looks too long ({length} characters; expected "
+            f"{SENDGRID_KEY_TYPICAL_LENGTH}). Check for duplicate PARTs or extra text in secrets."
+        )
+    return None
+
+
 def raw_sendgrid_key_material() -> tuple[str, str]:
     # Best option for Streamlit Cloud: one line, no wrapping issues
     b64 = secret_get("SENDGRID_API_KEY_B64")
@@ -94,6 +137,9 @@ def sendgrid_api_key() -> str:
             "If using PART1, PART2, … each value must be on one line (no Enter inside quotes). "
             "Recommended: use SENDGRID_API_KEY_B64 instead (single line)."
         )
+    length_issue = sendgrid_key_length_issue(key)
+    if length_issue:
+        raise ValueError(length_issue)
     return key
 
 
@@ -117,13 +163,17 @@ def sendgrid_key_diagnostics() -> Dict[str, Any]:
     try:
         raw, source = raw_sendgrid_key_material()
         key = normalize_sendgrid_key(raw)
+        length = len(key)
         return {
-            "ok": key.startswith("SG.") and len(key) >= 50,
+            "ok": key.startswith("SG.") and length == SENDGRID_KEY_TYPICAL_LENGTH,
             "source": source,
-            "length": len(key),
-            "prefix": key[:8] + "…" if len(key) >= 8 else key,
+            "length": length,
+            "expected_length": SENDGRID_KEY_TYPICAL_LENGTH,
+            "likely_truncated": length < SENDGRID_KEY_TYPICAL_LENGTH,
+            "prefix": key[:8] + "…" if length >= 8 else key,
             "has_b64_secret": has_b64,
             "part_keys_found": parts_loaded,
+            "part_lengths": _part_length_diagnostics(),
         }
     except Exception as ex:
         return {
@@ -153,10 +203,21 @@ def verify_sendgrid_key_with_api() -> Optional[str]:
     except urllib.error.HTTPError as ex:
         if ex.code == 401:
             diag = sendgrid_key_diagnostics()
+            length = diag.get("length", 0)
+            source = diag.get("source", "?")
+            if diag.get("likely_truncated"):
+                return (
+                    "SendGrid rejected the API key (401) — the key in secrets is truncated "
+                    f"({length} characters, expected {SENDGRID_KEY_TYPICAL_LENGTH}). "
+                    f"Loaded from {source}. Do not use PART1–PART4; remove those lines and add only "
+                    "SENDGRID_API_KEY_B64 (one line from Email setup help), then Reboot. "
+                    "If length is already 69, create a new Mail Send key in SendGrid and update B64."
+                )
             return (
                 "SendGrid rejected the API key (401). "
-                f"Loaded from {diag.get('source', '?')}, length {diag.get('length', 0)}. "
-                "Create a new API key in SendGrid (Mail Send), update secrets, Reboot app."
+                f"Loaded from {source}, length {length}. "
+                "The key may be revoked or wrong. Create a new API key in SendGrid (Mail Send), "
+                "encode it as SENDGRID_API_KEY_B64 (sidebar), update Cloud secrets, Reboot app."
             )
         return f"SendGrid key check failed: HTTP {ex.code}"
     except Exception as ex:

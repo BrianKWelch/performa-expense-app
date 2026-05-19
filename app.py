@@ -89,7 +89,7 @@ CATEGORIES = [
 def missing_email_secrets() -> List[str]:
     missing = []
     if not has_sendgrid_key():
-        missing.append("SENDGRID_API_KEY_PART1 + PART2 (one line each; use PART3/PART4 if needed)")
+        missing.append("SENDGRID_API_KEY_B64 (one line; use sidebar SendGrid setup to encode)")
     for key in ("SENDER_EMAIL", "FINANCE_EMAIL", "APPROVER_EMAIL"):
         if not secret_get(key).strip():
             missing.append(key)
@@ -557,7 +557,13 @@ def _render_email_setup_help(*, widget_key: str) -> None:
     diag = sendgrid_key_diagnostics()
     st.json(diag)
     if not diag.get("ok"):
-        st.warning("Key not valid yet — use SENDGRID_API_KEY_B64 (one line in Secrets).")
+        if diag.get("likely_truncated"):
+            st.warning(
+                f"Key is truncated ({diag.get('length')} chars, expected "
+                f"{diag.get('expected_length')}). Remove PART1–PART4 and use SENDGRID_API_KEY_B64 only."
+            )
+        else:
+            st.warning("Key not valid yet — use SENDGRID_API_KEY_B64 (one line in Secrets).")
 
 
 with st.sidebar:
